@@ -7,13 +7,14 @@ from book_processing.config import (
     LANGUAGES,
     PODCAST_SPEAKERS,
     PROSODY_RATE,
+    TTS_MAX_CHARS_PER_CHUNK,
     VOICE_FEMALE,
     VOICE_MALE,
 )
 
 # Azure Batch Synthesis has a practical SSML input limit (~64KB of text per input).
-# We chunk long texts to stay well within limits.
-MAX_CHARS_PER_CHUNK = 50_000
+# We stay well below that limit because smaller long-form chunks are more reliable.
+MAX_CHARS_PER_CHUNK = TTS_MAX_CHARS_PER_CHUNK
 
 
 def _escape_xml(text: str) -> str:

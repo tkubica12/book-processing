@@ -1,9 +1,19 @@
-"""Text-to-Speech using Azure Batch Synthesis REST API."""
+"""Text-to-Speech using Azure Batch Synthesis REST API with parallel job execution.
 
+Key optimization: large files (source_tts) are split into independent parallel
+jobs per SSML chunk.  Each chunk synthesizes independently on Azure, then
+results are concatenated.  This reduces wall-clock time from 30-60 min to
+5-10 min for a full-book audio file.
+"""
+
+import io
 import logging
+import threading
 import time
 import uuid
+import zipfile
 from pathlib import Path
+from queue import Empty, Queue
 
 import httpx
 from azure.identity import DefaultAzureCredential
@@ -17,6 +27,8 @@ from book_processing.config import (
     OUTPUT_DIR,
     SOURCE_TTS_NAME,
     SUMMARY_TYPES,
+    TTS_JOB_MAX_RETRIES,
+    TTS_MAX_CONCURRENT_JOBS,
     output_audio_path,
     output_text_path,
 )
@@ -25,17 +37,43 @@ from book_processing.ssml_builder import build_chunked_ssml
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 10
-MAX_POLL_ATTEMPTS = 360  # 1 hour max
+
+# Module-level cached credential and token
+_credential = DefaultAzureCredential()
+_cached_token: str | None = None
+_token_expires_on: float = 0.0
+_token_lock = threading.Lock()
 
 
-def _get_auth_headers() -> dict[str, str]:
-    """Get authorization headers using Entra authentication."""
-    credential = DefaultAzureCredential()
-    token = credential.get_token(AZURE_COGNITIVE_SCOPE).token
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+def _get_token() -> str:
+    """Get a cached access token, refreshing only when near expiry (5 min buffer)."""
+    global _cached_token, _token_expires_on
+    with _token_lock:
+        if _cached_token and time.time() < _token_expires_on - 300:
+            return _cached_token
+
+    # Refresh outside lock to avoid blocking other threads
+    for attempt in range(5):
+        try:
+            access_token = _credential.get_token(AZURE_COGNITIVE_SCOPE)
+            with _token_lock:
+                _cached_token = access_token.token
+                _token_expires_on = access_token.expires_on
+            logger.debug("Token refreshed (expires in %.0f min)",
+                         (_token_expires_on - time.time()) / 60)
+            return access_token.token
+        except Exception as e:
+            wait = 10 * (attempt + 1)
+            if attempt < 4:
+                logger.warning("Token refresh failed (attempt %d): %s. Retrying in %ds...",
+                               attempt + 1, e, wait)
+                time.sleep(wait)
+            else:
+                raise
+
+
+def _auth_headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
 def _submit_batch_synthesis(
@@ -44,127 +82,88 @@ def _submit_batch_synthesis(
     ssml_inputs: list[str],
     display_name: str,
 ) -> str:
-    """Submit a batch synthesis job and return the job ID.
-
-    Args:
-        client: HTTP client.
-        headers: Auth headers.
-        ssml_inputs: List of SSML strings to synthesize.
-        display_name: Human-readable name for the job.
-
-    Returns:
-        The batch synthesis job ID.
-    """
+    """Submit a batch synthesis job and return the job ID."""
     job_id = str(uuid.uuid4())
     url = (
         f"{AZURE_SPEECH_ENDPOINT}/texttospeech/batchsyntheses/{job_id}"
         f"?api-version={AZURE_SPEECH_API_VERSION}"
     )
-
-    inputs = [{"content": ssml} for ssml in ssml_inputs]
-
     body = {
         "displayName": display_name,
         "description": f"Book processing: {display_name}",
         "inputKind": "SSML",
-        "inputs": inputs,
+        "inputs": [{"content": ssml} for ssml in ssml_inputs],
         "properties": {
             "outputFormat": AUDIO_OUTPUT_FORMAT,
             "concatenateResult": True,
         },
     }
 
-    logger.info("Submitting batch synthesis job '%s' (id=%s, %d input(s))...", display_name, job_id, len(inputs))
-    response = client.put(url, json=body, headers=headers)
-    response.raise_for_status()
-    logger.info("Job submitted successfully: %s", job_id)
-    return job_id
+    logger.info("Submitting TTS job '%s' (id=%s, %d input(s))...", display_name, job_id, len(ssml_inputs))
+    for attempt in range(5):
+        try:
+            response = client.put(url, json=body, headers=headers)
+            response.raise_for_status()
+            logger.info("Job submitted: %s", job_id)
+            return job_id
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.warning("Submit failed (attempt %d): %s. Retrying...", attempt + 1, e)
+            time.sleep(10 * (attempt + 1))
+    raise RuntimeError(f"Failed to submit TTS job '{display_name}' after 5 attempts")
 
 
-def _poll_job(client: httpx.Client, headers: dict[str, str], job_id: str) -> dict:
-    """Poll a batch synthesis job until completion.
-
-    Returns:
-        The final job status response as a dict.
-    """
+def _check_job_status(client: httpx.Client, headers: dict[str, str], job_id: str) -> dict | None:
+    """Check status. Returns job data if Succeeded, None if still running, raises on failure."""
     url = (
         f"{AZURE_SPEECH_ENDPOINT}/texttospeech/batchsyntheses/{job_id}"
         f"?api-version={AZURE_SPEECH_API_VERSION}"
     )
-
-    consecutive_errors = 0
-    for attempt in range(MAX_POLL_ATTEMPTS):
-        # Refresh token every 5 min (30 polls × 10s)
-        if attempt > 0 and attempt % 30 == 0:
-            try:
-                credential = DefaultAzureCredential()
-                token = credential.get_token(AZURE_COGNITIVE_SCOPE).token
-                headers["Authorization"] = f"Bearer {token}"
-            except Exception as e:
-                logger.warning("Token refresh failed: %s", e)
-
-        try:
-            response = client.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            status = data.get("status", "Unknown")
-            consecutive_errors = 0
-
-            if status == "Succeeded":
-                logger.info("Job %s completed successfully", job_id)
-                return data
-            elif status in ("Failed", "Cancelled"):
-                error = data.get("properties", {}).get("error", "Unknown error")
-                raise RuntimeError(f"Batch synthesis job {job_id} failed: {error}")
-            else:
-                logger.debug("Job %s status: %s (attempt %d/%d)", job_id, status, attempt + 1, MAX_POLL_ATTEMPTS)
-        except (httpx.ConnectError, httpx.TimeoutException, OSError) as e:
-            consecutive_errors += 1
-            logger.warning("Poll error (attempt %d, %d consecutive): %s", attempt + 1, consecutive_errors, e)
-            if consecutive_errors >= 10:
-                raise RuntimeError(f"Too many consecutive poll errors for job {job_id}") from e
-
-        time.sleep(POLL_INTERVAL_SECONDS)
-
-    raise TimeoutError(f"Job {job_id} did not complete within {MAX_POLL_ATTEMPTS * POLL_INTERVAL_SECONDS}s")
+    try:
+        response = client.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        status = data.get("status", "Unknown")
+        if status == "Succeeded":
+            return data
+        if status in ("Failed", "Cancelled"):
+            error = data.get("properties", {}).get("error", "Unknown error")
+            raise RuntimeError(f"Batch synthesis job {job_id} failed: {error}")
+        return None
+    except (httpx.ConnectError, httpx.TimeoutException, OSError) as e:
+        logger.warning("Poll error for %s: %s", job_id, e)
+        return None
 
 
-def _download_result(client: httpx.Client, headers: dict[str, str], job_data: dict, output_path: Path) -> None:
-    """Download the synthesized audio from a completed job."""
-    outputs = job_data.get("outputs", {})
-    result_url = outputs.get("result")
+def _download_audio_bytes(client: httpx.Client, job_data: dict) -> bytes:
+    """Download synthesized audio bytes from a completed job (SAS URL, no auth header)."""
+    result_url = job_data.get("outputs", {}).get("result")
     if not result_url:
         raise ValueError(f"No result URL in job data: {job_data}")
 
-    logger.info("Downloading audio to %s...", output_path)
-    # SAS URL already contains auth in query string — don't send Bearer token
-    response = client.get(result_url, follow_redirects=True)
-    response.raise_for_status()
-
-    # The result is a ZIP containing the audio file(s)
-    import io
-    import zipfile
+    for attempt in range(3):
+        try:
+            response = client.get(result_url, follow_redirects=True, timeout=600)
+            response.raise_for_status()
+            break
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.warning("Download failed (attempt %d): %s", attempt + 1, e)
+            if attempt == 2:
+                raise
+            time.sleep(15)
 
     zip_data = io.BytesIO(response.content)
     with zipfile.ZipFile(zip_data) as zf:
-        # Find the audio file in the ZIP
         audio_files = [f for f in zf.namelist() if f.endswith(('.mp3', '.wav'))]
         if not audio_files:
-            # If concatenateResult is true, there might be a single file
             audio_files = [f for f in zf.namelist() if not f.endswith('/')]
-
         if not audio_files:
-            raise ValueError(f"No audio files found in result ZIP: {zf.namelist()}")
-
-        # Use the first (or only) audio file
-        with zf.open(audio_files[0]) as audio_f:
-            output_path.write_bytes(audio_f.read())
-
-    logger.info("Saved audio: %s (%.1f MB)", output_path.name, output_path.stat().st_size / 1024 / 1024)
+            raise ValueError(f"No audio files in result ZIP: {zf.namelist()}")
+        with zf.open(audio_files[0]) as af:
+            return af.read()
 
 
 def _delete_job(client: httpx.Client, headers: dict[str, str], job_id: str) -> None:
-    """Delete a completed batch synthesis job to clean up."""
+    """Delete a completed job to clean up."""
     url = (
         f"{AZURE_SPEECH_ENDPOINT}/texttospeech/batchsyntheses/{job_id}"
         f"?api-version={AZURE_SPEECH_API_VERSION}"
@@ -176,103 +175,261 @@ def _delete_job(client: httpx.Client, headers: dict[str, str], job_id: str) -> N
         logger.warning("Failed to delete job %s (non-critical)", job_id)
 
 
-def synthesize_text(
-    client: httpx.Client,
-    headers: dict[str, str],
-    text: str,
-    lang: str,
-    output_path: Path,
-    is_podcast: bool = False,
-    display_name: str = "",
-) -> Path:
-    """Synthesize a single text to audio via the Batch Synthesis API.
+# ---------------------------------------------------------------------------
+# TtsJobTracker - queue-driven, thread-safe TTS manager
+# ---------------------------------------------------------------------------
 
-    Includes retry logic for transient network failures.
+class TtsJobTracker:
+    """Manages TTS batch synthesis jobs with a queue-driven, poll-based loop.
 
-    Args:
-        client: HTTP client.
-        headers: Auth headers.
-        text: Plain text or podcast script.
-        lang: Language code ('en' or 'cs').
-        output_path: Where to save the audio file.
-        is_podcast: If True, use multi-voice podcast SSML.
-        display_name: Human-readable name for the job.
+    Large files (multiple SSML chunks) are exploded into independent parallel
+    jobs.  Each chunk is synthesized separately, then the MP3 results are
+    concatenated in order once all chunks for that file complete.
 
-    Returns:
-        Path to the saved audio file.
+    Usage::
+
+        tracker = TtsJobTracker()
+        Thread(target=tracker.poll_loop).start()
+        tracker.enqueue("summary_2min", "en", path, is_podcast=False)
+        tracker.finalize()
+        tracker.wait()
+        outputs = tracker.get_outputs()
     """
-    ssml_chunks = build_chunked_ssml(text, lang, is_podcast=is_podcast)
-    job_id = _submit_batch_synthesis(client, headers, ssml_chunks, display_name or output_path.stem)
-    job_data = _poll_job(client, headers, job_id)
-    _download_result(client, headers, job_data, output_path)
-    _delete_job(client, headers, job_id)
-    return output_path
 
+    def __init__(self) -> None:
+        self._pending: Queue[dict | None] = Queue()
+        self._active: list[dict] = []      # individual chunk jobs
+        self._completed: dict[str, Path] = {}
+        self._finalized = threading.Event()
+        self._done = threading.Event()
+        self._error: Exception | None = None
+        # Multi-chunk assembly: display -> {total, parts: {idx: bytes}}
+        self._assembly: dict[str, dict] = {}
+        self._assembly_lock = threading.Lock()
+
+    def enqueue(self, name: str, lang: str, text_path: Path, is_podcast: bool) -> None:
+        """Thread-safe: add a new TTS request to the processing queue."""
+        self._pending.put({
+            "name": name, "lang": lang, "text_path": text_path, "is_podcast": is_podcast,
+        })
+
+    def finalize(self) -> None:
+        """Signal that no more jobs will be enqueued."""
+        self._finalized.set()
+
+    def wait(self) -> None:
+        """Block until all jobs are done. Re-raises any error from the poll loop."""
+        self._done.wait()
+        if self._error:
+            raise self._error
+
+    def get_outputs(self) -> dict[str, Path]:
+        return dict(self._completed)
+
+    def poll_loop(self) -> None:
+        """Main processing loop: dequeue, submit, poll, download."""
+        client = httpx.Client(timeout=300)
+        try:
+            while True:
+                # Drain pending queue, submit up to concurrency limit
+                while len(self._active) < TTS_MAX_CONCURRENT_JOBS:
+                    try:
+                        item = self._pending.get_nowait()
+                    except Empty:
+                        break
+                    if item is None:
+                        continue
+                    self._submit_item(client, item)
+
+                # Poll active jobs
+                if self._active:
+                    token = _get_token()
+                    headers = _auth_headers(token)
+                    completed = []
+                    for job in self._active:
+                        try:
+                            data = _check_job_status(client, headers, job["job_id"])
+                        except RuntimeError as exc:
+                            if self._retry_failed_job(client, headers, job, exc):
+                                continue
+                            raise
+                        if data is not None:
+                            self._handle_completed_job(client, headers, job, data)
+                            completed.append(job)
+                    for job in completed:
+                        self._active.remove(job)
+
+                # Check exit condition
+                if self._finalized.is_set() and self._pending.empty() and not self._active:
+                    break
+
+                time.sleep(POLL_INTERVAL_SECONDS)
+        except Exception as e:
+            logger.error("TTS poll loop error: %s", e)
+            self._error = e
+        finally:
+            client.close()
+            self._done.set()
+
+    def _handle_completed_job(
+        self, client: httpx.Client, headers: dict[str, str],
+        job: dict, job_data: dict,
+    ) -> None:
+        """Process a completed job - either save directly or assemble chunks."""
+        display = job["display"]
+        audio_bytes = _download_audio_bytes(client, job_data)
+        _delete_job(client, headers, job["job_id"])
+
+        parent = job.get("parent_display")
+        if parent is None:
+            # Single-job file: write directly
+            job["audio_path"].write_bytes(audio_bytes)
+            self._completed[display] = job["audio_path"]
+            logger.info("TTS done: %s (%.1f MB)", display,
+                        job["audio_path"].stat().st_size / 1024 / 1024)
+        else:
+            # Multi-chunk file: collect this chunk
+            chunk_idx = job["chunk_idx"]
+            logger.info("TTS chunk done: %s chunk %d (%.1f MB)",
+                        parent, chunk_idx + 1, len(audio_bytes) / 1024 / 1024)
+            with self._assembly_lock:
+                entry = self._assembly[parent]
+                entry["parts"][chunk_idx] = audio_bytes
+                done_count = len(entry["parts"])
+                total = entry["total"]
+
+            if done_count == total:
+                self._assemble_chunks(parent)
+
+    def _assemble_chunks(self, display: str) -> None:
+        """Concatenate all chunk MP3s into the final output file."""
+        with self._assembly_lock:
+            entry = self._assembly[display]
+        audio_path = entry["audio_path"]
+
+        logger.info("Assembling %d chunks for %s...", entry["total"], display)
+        with open(audio_path, "wb") as f:
+            for idx in range(entry["total"]):
+                f.write(entry["parts"][idx])
+
+        size_mb = audio_path.stat().st_size / 1024 / 1024
+        self._completed[display] = audio_path
+        logger.info("TTS assembled: %s (%.1f MB from %d chunks)",
+                     display, size_mb, entry["total"])
+
+        # Free memory
+        with self._assembly_lock:
+            del self._assembly[display]
+
+    def _retry_failed_job(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        job: dict,
+        error: RuntimeError,
+    ) -> bool:
+        """Retry a failed Azure batch job in place when retry budget remains."""
+        retries = job.get("retries", 0)
+        display = job["display"]
+        if retries >= TTS_JOB_MAX_RETRIES:
+            logger.error("TTS job %s exhausted retries: %s", display, error)
+            return False
+
+        logger.warning(
+            "Retrying failed TTS job %s (%d/%d): %s",
+            display,
+            retries + 1,
+            TTS_JOB_MAX_RETRIES,
+            error,
+        )
+        _delete_job(client, headers, job["job_id"])
+        time.sleep(5 * (retries + 1))
+        job["job_id"] = _submit_batch_synthesis(
+            client,
+            headers,
+            job["ssml_inputs"],
+            display,
+        )
+        job["retries"] = retries + 1
+        return True
+
+    def _submit_item(self, client: httpx.Client, item: dict) -> None:
+        """Prepare SSML and submit job(s) for one text file.
+
+        For files with multiple SSML chunks, each chunk becomes an independent
+        parallel job for maximum throughput.
+        """
+        name, lang = item["name"], item["lang"]
+        audio_path = output_audio_path(name, lang)
+        display = f"{name}_{lang}"
+
+        if audio_path.exists() and audio_path.stat().st_size > 1000:
+            logger.info("TTS already exists: %s", display)
+            self._completed[display] = audio_path
+            return
+
+        text = item["text_path"].read_text(encoding="utf-8")
+        ssml_chunks = build_chunked_ssml(text, lang, is_podcast=item["is_podcast"])
+        token = _get_token()
+        headers = _auth_headers(token)
+
+        if len(ssml_chunks) == 1:
+            # Small file: single job
+            job_id = _submit_batch_synthesis(client, headers, ssml_chunks, display)
+            self._active.append({
+                "job_id": job_id,
+                "display": display,
+                "audio_path": audio_path,
+                "ssml_inputs": ssml_chunks,
+                "retries": 0,
+            })
+        else:
+            # Large file: one independent job per chunk for parallel synthesis
+            logger.info("Splitting %s into %d parallel TTS jobs", display, len(ssml_chunks))
+            with self._assembly_lock:
+                self._assembly[display] = {
+                    "total": len(ssml_chunks),
+                    "parts": {},
+                    "audio_path": audio_path,
+                }
+            for idx, ssml in enumerate(ssml_chunks):
+                chunk_display = f"{display}_chunk{idx + 1}"
+                job_id = _submit_batch_synthesis(client, headers, [ssml], chunk_display)
+                self._active.append({
+                    "job_id": job_id,
+                    "display": chunk_display,
+                    "audio_path": audio_path,
+                    "parent_display": display,
+                    "chunk_idx": idx,
+                    "ssml_inputs": [ssml],
+                    "retries": 0,
+                })
+
+
+# ---------------------------------------------------------------------------
+# Standalone run() - scans output dir and processes all text files
+# ---------------------------------------------------------------------------
 
 def run(output_dir: Path = OUTPUT_DIR) -> dict[str, Path]:
-    """Run the full TTS stage — synthesize all text outputs to audio.
+    """Process all available text files into audio (standalone mode)."""
+    tracker = TtsJobTracker()
 
-    Expects text files to already exist in output_dir from the LLM stage.
+    poll_thread = threading.Thread(target=tracker.poll_loop, daemon=True)
+    poll_thread.start()
 
-    Returns:
-        Dictionary mapping output names to their audio file paths.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    headers = _get_auth_headers()
-    outputs: dict[str, Path] = {}
-
-    with httpx.Client(timeout=300) as client:
-        # Synthesize summaries
-        for summary_type, spec in SUMMARY_TYPES.items():
-            for lang in LANGUAGES:
-                text_path = output_text_path(summary_type, lang)
-                if not text_path.exists():
-                    logger.warning("Missing text file: %s — skipping", text_path)
-                    continue
-
-                text = text_path.read_text(encoding="utf-8")
-                audio_path = output_audio_path(summary_type, lang)
-                display = f"{summary_type}_{lang}"
-
-                if audio_path.exists() and audio_path.stat().st_size > 1000:
-                    logger.info("Skipping %s (audio already exists with %d bytes)", display, audio_path.stat().st_size)
-                    outputs[display] = audio_path
-                    continue
-
-                # Refresh token before each job
-                headers = _get_auth_headers()
-                logger.info("Synthesizing %s...", display)
-                synthesize_text(
-                    client, headers, text, lang, audio_path,
-                    is_podcast=spec["is_podcast"],
-                    display_name=display,
-                )
-                outputs[display] = audio_path
-
-        # Synthesize full TTS source
+    for summary_type, spec in SUMMARY_TYPES.items():
         for lang in LANGUAGES:
-            text_path = output_text_path(SOURCE_TTS_NAME, lang)
-            if not text_path.exists():
-                logger.warning("Missing TTS source file: %s — skipping", text_path)
-                continue
+            text_path = output_text_path(summary_type, lang)
+            if text_path.exists():
+                tracker.enqueue(summary_type, lang, text_path, spec["is_podcast"])
 
-            text = text_path.read_text(encoding="utf-8")
-            audio_path = output_audio_path(SOURCE_TTS_NAME, lang)
-            display = f"{SOURCE_TTS_NAME}_{lang}"
+    for lang in LANGUAGES:
+        text_path = output_text_path(SOURCE_TTS_NAME, lang)
+        if text_path.exists():
+            tracker.enqueue(SOURCE_TTS_NAME, lang, text_path, False)
 
-            if audio_path.exists() and audio_path.stat().st_size > 1000:
-                logger.info("Skipping %s (audio already exists with %d bytes)", display, audio_path.stat().st_size)
-                outputs[display] = audio_path
-                continue
+    tracker.finalize()
+    tracker.wait()
+    poll_thread.join()
 
-            # Refresh token before each job
-            headers = _get_auth_headers()
-            logger.info("Synthesizing full source %s...", display)
-            synthesize_text(
-                client, headers, text, lang, audio_path,
-                is_podcast=False,
-                display_name=display,
-            )
-            outputs[display] = audio_path
-
-    return outputs
+    return tracker.get_outputs()

@@ -13,7 +13,7 @@ def test_build_single_voice_ssml_english():
     ssml = build_single_voice_ssml("Hello world", "en")
     assert 'xml:lang="en-US"' in ssml
     assert 'name="en-US-Andrew:DragonHDLatestNeural"' in ssml
-    assert 'rate="+30%"' in ssml
+    assert 'rate="+20%"' in ssml
     assert "Hello world" in ssml
     assert ssml.startswith("<speak")
     assert ssml.endswith("</speak>")
@@ -57,7 +57,7 @@ def test_build_podcast_ssml():
     assert ssml.count('<voice name=') == 2
     assert "First segment." in ssml
     assert "Second segment." in ssml
-    assert 'rate="+30%"' in ssml
+    assert 'rate="+20%"' in ssml
 
 
 def test_chunk_text_short():

@@ -23,7 +23,7 @@ VOICE_MALE = "en-US-Andrew:DragonHDLatestNeural"
 VOICE_FEMALE = "en-US-Emma:DragonHDLatestNeural"
 
 # === SSML / Prosody ===
-PROSODY_RATE = "+30%"
+PROSODY_RATE = "+20%"
 AUDIO_OUTPUT_FORMAT = "audio-48khz-192kbitrate-mono-mp3"
 
 # === Language Configuration ===
@@ -38,35 +38,45 @@ PODCAST_SPEAKERS = {
     "cs": {"male": "Tomáš", "female": "Kateřina"},
 }
 
-# === Word Count Targets (at 130% speaking speed ≈ 195 WPM) ===
-WPM_AT_130_PERCENT = 195
+# === Word Count Targets ===
+# Calibrated from measured MP3 durations:
+#   EN at +30%: ~181 WPM → base ~139 → at +20%: ~167 WPM
+#   CS at +30%: ~167 WPM → base ~128 → at +20%: ~154 WPM
+#   Using 160 WPM as unified target (slightly favors shorter output for safety)
+WPM_AT_TARGET_SPEED = 160
 
 SUMMARY_TYPES = {
     "summary_2min": {
         "duration_min": 2,
-        "target_words": 2 * WPM_AT_130_PERCENT,  # ~390
+        "target_words": 2 * WPM_AT_TARGET_SPEED,  # ~320
         "description": "High-level architectural summary",
         "is_podcast": False,
     },
     "summary_5min": {
         "duration_min": 5,
-        "target_words": 5 * WPM_AT_130_PERCENT,  # ~975
+        "target_words": 5 * WPM_AT_TARGET_SPEED,  # ~800
         "description": "Architecture patterns, trade-offs, technology choices",
         "is_podcast": False,
     },
     "summary_20min": {
         "duration_min": 20,
-        "target_words": 20 * WPM_AT_130_PERCENT,  # ~3900
+        "target_words": 20 * WPM_AT_TARGET_SPEED,  # ~3200
         "description": "Technical deep-dive with implementation details",
         "is_podcast": False,
     },
     "podcast_60min": {
         "duration_min": 60,
-        "target_words": 60 * WPM_AT_130_PERCENT,  # ~11700
+        "target_words": 60 * WPM_AT_TARGET_SPEED,  # ~9600
         "description": "Two-host technical podcast, entertaining and deeply technical",
         "is_podcast": True,
     },
 }
+
+# === Parallelism ===
+LLM_MAX_WORKERS = 6  # Concurrent LLM requests
+TTS_MAX_CONCURRENT_JOBS = 8  # Concurrent Batch Synthesis jobs
+TTS_JOB_MAX_RETRIES = 3  # Retries per submitted batch job before failing
+TTS_MAX_CHARS_PER_CHUNK = 25_000  # Smaller chunks are more reliable for long-form TTS
 
 # === File Naming ===
 def output_text_path(name: str, lang: str) -> Path:
