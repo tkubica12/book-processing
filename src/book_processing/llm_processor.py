@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 8
 
-# Callback signature: (content_name, lang, path, is_podcast)
-FileReadyCallback = Callable[[str, str, Path, bool], None]
+# Callback signature: (book_name, content_name, lang, path, is_podcast)
+FileReadyCallback = Callable[[str, str, str, Path, bool], None]
 
 
 def _get_client() -> AzureOpenAI:
@@ -120,7 +120,7 @@ def _do_simple_summary(client: AzureOpenAI, source_md: str, summary_type: str, l
 
 def _do_podcast_section(
     client: AzureOpenAI, section_text: str,
-    section_idx: int, total_sections: int, lang: str,
+    section_idx: int, total_sections: int, lang: str, book_name: str, output_dir: Path,
 ) -> str:
     """Generate a single podcast section with crash recovery via partial files."""
     speakers = PODCAST_SPEAKERS[lang]
@@ -129,9 +129,9 @@ def _do_podcast_section(
     words_per_section = target_words // total_sections
     section_num = section_idx + 1
 
-    partial_dir = OUTPUT_DIR / "_partial"
+    partial_dir = output_dir / "_partial"
     partial_dir.mkdir(exist_ok=True)
-    partial_path = partial_dir / f"podcast_60min_{lang}_section{section_num}.md"
+    partial_path = partial_dir / f"{book_name}_podcast_60min_{lang}_section{section_num}.md"
 
     if partial_path.exists() and partial_path.stat().st_size > 100:
         logger.info("Loading cached podcast section %d/%d for %s", section_num, total_sections, lang)
@@ -183,15 +183,15 @@ def _do_podcast_section(
 
 def _do_tts_chunk(
     client: AzureOpenAI, chunk_text: str,
-    chunk_idx: int, total_chunks: int, lang: str,
+    chunk_idx: int, total_chunks: int, lang: str, book_name: str, output_dir: Path,
 ) -> str:
     """Process a single TTS source chunk with crash recovery."""
     lang_label = LANGUAGES[lang]["label"]
     chunk_num = chunk_idx + 1
 
-    partial_dir = OUTPUT_DIR / "_partial"
+    partial_dir = output_dir / "_partial"
     partial_dir.mkdir(exist_ok=True)
-    partial_path = partial_dir / f"source_tts_{lang}_chunk{chunk_num}.md"
+    partial_path = partial_dir / f"{book_name}_source_tts_{lang}_chunk{chunk_num}.md"
 
     if partial_path.exists() and partial_path.stat().st_size > 100:
         logger.info("Loading cached TTS chunk %d/%d for %s", chunk_num, total_chunks, lang)
@@ -236,6 +236,7 @@ def _do_tts_chunk(
 # ---------------------------------------------------------------------------
 
 def run(
+    book_name: str,
     source_md_path: Path,
     output_dir: Path = OUTPUT_DIR,
     on_file_ready: FileReadyCallback | None = None,
@@ -247,6 +248,7 @@ def run(
     their constituents complete.
 
     Args:
+        book_name: Sanitized identifier of the source PDF/book.
         source_md_path: Path to the raw markdown source.
         output_dir: Directory for output files.
         on_file_ready: Optional callback invoked when a complete text file
@@ -277,8 +279,8 @@ def run(
         if spec["is_podcast"]:
             continue
         for lang in LANGUAGES:
-            path = output_text_path(stype, lang)
-            key = f"{stype}_{lang}"
+            path = output_text_path(book_name, stype, lang)
+            key = f"{book_name}_{stype}_{lang}"
             if path.exists() and path.stat().st_size > 100:
                 logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
                 outputs[key] = path
@@ -292,8 +294,8 @@ def run(
             })
 
     for lang in LANGUAGES:
-        path = output_text_path("podcast_60min", lang)
-        key = f"podcast_60min_{lang}"
+        path = output_text_path(book_name, "podcast_60min", lang)
+        key = f"{book_name}_podcast_60min_{lang}"
         if path.exists() and path.stat().st_size > 100:
             logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
             outputs[key] = path
@@ -310,8 +312,8 @@ def run(
             })
 
     for lang in LANGUAGES:
-        path = output_text_path(SOURCE_TTS_NAME, lang)
-        key = f"{SOURCE_TTS_NAME}_{lang}"
+        path = output_text_path(book_name, SOURCE_TTS_NAME, lang)
+        key = f"{book_name}_{SOURCE_TTS_NAME}_{lang}"
         if path.exists() and path.stat().st_size > 100:
             logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
             outputs[key] = path
@@ -349,7 +351,7 @@ def run(
                 outputs[key] = task["path"]
             logger.info("-> %s (%d words)", key, len(text.split()))
             if on_file_ready:
-                on_file_ready(task["summary_type"], task["lang"], task["path"], False)
+                on_file_ready(book_name, task["summary_type"], task["lang"], task["path"], False)
 
         elif ttype == "podcast_section":
             lang = task["lang"]
@@ -361,15 +363,15 @@ def run(
                         task["key"], len(text.split()), done_count, total)
             if done_count == total:
                 assembled = "\n\n".join(podcast_parts[lang][i] for i in range(total))
-                path = output_text_path("podcast_60min", lang)
+                path = output_text_path(book_name, "podcast_60min", lang)
                 path.write_text(assembled, encoding="utf-8")
-                key = f"podcast_60min_{lang}"
+                key = f"{book_name}_podcast_60min_{lang}"
                 with lock:
                     outputs[key] = path
                 logger.info("=> Assembled %s (%d words from %d sections)",
                             key, len(assembled.split()), total)
                 if on_file_ready:
-                    on_file_ready("podcast_60min", lang, path, True)
+                    on_file_ready(book_name, "podcast_60min", lang, path, True)
 
         elif ttype == "tts_chunk":
             lang = task["lang"]
@@ -381,15 +383,15 @@ def run(
                         task["key"], len(text.split()), done_count, total)
             if done_count == total:
                 assembled = "\n\n".join(tts_parts[lang][i] for i in range(total))
-                path = output_text_path(SOURCE_TTS_NAME, lang)
+                path = output_text_path(book_name, SOURCE_TTS_NAME, lang)
                 path.write_text(assembled, encoding="utf-8")
-                key = f"{SOURCE_TTS_NAME}_{lang}"
+                key = f"{book_name}_{SOURCE_TTS_NAME}_{lang}"
                 with lock:
                     outputs[key] = path
                 logger.info("=> Assembled %s (%d words from %d chunks)",
                             key, len(assembled.split()), total)
                 if on_file_ready:
-                    on_file_ready(SOURCE_TTS_NAME, lang, path, False)
+                    on_file_ready(book_name, SOURCE_TTS_NAME, lang, path, False)
 
     # Execute all tasks in a single pool
     with ThreadPoolExecutor(max_workers=LLM_MAX_WORKERS) as pool:
@@ -403,12 +405,12 @@ def run(
             elif task["type"] == "podcast_section":
                 future = pool.submit(
                     _do_podcast_section, client, task["section_text"],
-                    task["section_idx"], task["total_sections"], task["lang"],
+                    task["section_idx"], task["total_sections"], task["lang"], book_name, output_dir,
                 )
             elif task["type"] == "tts_chunk":
                 future = pool.submit(
                     _do_tts_chunk, client, task["chunk_text"],
-                    task["chunk_idx"], task["total_chunks"], task["lang"],
+                    task["chunk_idx"], task["total_chunks"], task["lang"], book_name, output_dir,
                 )
             futures[future] = task
 

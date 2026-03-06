@@ -4,7 +4,7 @@ PDF-to-Markdown, technical summarization, translation, and Azure TTS pipeline fo
 
 ## What it does
 
-- Converts every PDF in `input\` to Markdown with `markitdown`, concatenates them, and writes a cleaned source file to `output\source_raw.md`.
+- Treats every PDF in `input\` as a separate book, converts it with `markitdown`, and writes a cleaned per-book source file to `output\`.
 - Uses Azure OpenAI (`gpt-5.2`) to generate English and Czech outputs:
   - `summary_2min`
   - `summary_5min`
@@ -15,22 +15,24 @@ PDF-to-Markdown, technical summarization, translation, and Azure TTS pipeline fo
 
 ## Output files
 
-Text outputs:
+Each output filename includes the sanitized source PDF name. For example, `Inference Engineering.pdf` becomes `inference_engineering_*`.
 
-- `output\source_raw.md`
-- `output\summary_2min_en.md`, `output\summary_2min_cs.md`
-- `output\summary_5min_en.md`, `output\summary_5min_cs.md`
-- `output\summary_20min_en.md`, `output\summary_20min_cs.md`
-- `output\podcast_60min_en.md`, `output\podcast_60min_cs.md`
-- `output\source_tts_en.md`, `output\source_tts_cs.md`
+Text outputs per book:
 
-Audio outputs:
+- `output\<book_name>_source_raw.md`
+- `output\<book_name>_summary_2min_en.md`, `output\<book_name>_summary_2min_cs.md`
+- `output\<book_name>_summary_5min_en.md`, `output\<book_name>_summary_5min_cs.md`
+- `output\<book_name>_summary_20min_en.md`, `output\<book_name>_summary_20min_cs.md`
+- `output\<book_name>_podcast_60min_en.md`, `output\<book_name>_podcast_60min_cs.md`
+- `output\<book_name>_source_tts_en.md`, `output\<book_name>_source_tts_cs.md`
 
-- `output\summary_2min_en.mp3`, `output\summary_2min_cs.mp3`
-- `output\summary_5min_en.mp3`, `output\summary_5min_cs.mp3`
-- `output\summary_20min_en.mp3`, `output\summary_20min_cs.mp3`
-- `output\podcast_60min_en.mp3`, `output\podcast_60min_cs.mp3`
-- `output\source_tts_en.mp3`, `output\source_tts_cs.mp3`
+Audio outputs per book:
+
+- `output\<book_name>_summary_2min_en.mp3`, `output\<book_name>_summary_2min_cs.mp3`
+- `output\<book_name>_summary_5min_en.mp3`, `output\<book_name>_summary_5min_cs.mp3`
+- `output\<book_name>_summary_20min_en.mp3`, `output\<book_name>_summary_20min_cs.mp3`
+- `output\<book_name>_podcast_60min_en.mp3`, `output\<book_name>_podcast_60min_cs.mp3`
+- `output\<book_name>_source_tts_en.mp3`, `output\<book_name>_source_tts_cs.mp3`
 
 ## Requirements
 
@@ -69,12 +71,13 @@ uv run python -m book_processing.main
 
 ## Parallelism and reliability
 
+- PDFs are treated as independent books and processed in parallel batches.
 - PDF conversion runs first, then LLM generation and TTS run overlapped.
-- LLM work is flattened into independent tasks and processed concurrently.
+- LLM work is flattened into independent tasks and processed concurrently within each book.
 - Full-length TTS files are split into smaller chunks and synthesized in parallel.
 - TTS access tokens are cached to avoid repeated Azure CLI calls during polling.
 - Failed Azure batch TTS chunks are retried individually instead of aborting the entire file immediately.
-- Existing text and audio outputs are reused, so reruns resume work instead of regenerating everything.
+- Existing text and audio outputs are reused per book, so reruns resume work instead of regenerating everything.
 
 ## Development
 

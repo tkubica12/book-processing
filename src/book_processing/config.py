@@ -1,5 +1,6 @@
 """Centralized configuration for the book processing pipeline."""
 
+import re
 from pathlib import Path
 
 # === Project Paths ===
@@ -73,20 +74,34 @@ SUMMARY_TYPES = {
 }
 
 # === Parallelism ===
+BOOK_MAX_WORKERS = 2  # Concurrent books processed in parallel batches
 LLM_MAX_WORKERS = 6  # Concurrent LLM requests
 TTS_MAX_CONCURRENT_JOBS = 8  # Concurrent Batch Synthesis jobs
 TTS_JOB_MAX_RETRIES = 3  # Retries per submitted batch job before failing
 TTS_MAX_CHARS_PER_CHUNK = 25_000  # Smaller chunks are more reliable for long-form TTS
 
 # === File Naming ===
-def output_text_path(name: str, lang: str) -> Path:
-    """Return the output path for a text file, e.g. output/summary_2min_en.md."""
-    return OUTPUT_DIR / f"{name}_{lang}.md"
+def sanitize_book_name(name: str) -> str:
+    """Convert a PDF stem into a filesystem-safe book identifier."""
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", name.strip()).strip("_")
+    return normalized.lower() or "book"
 
 
-def output_audio_path(name: str, lang: str) -> Path:
-    """Return the output path for an audio file, e.g. output/summary_2min_en.mp3."""
-    return OUTPUT_DIR / f"{name}_{lang}.mp3"
+def book_name_from_pdf(pdf_path: Path) -> str:
+    """Return the sanitized book name derived from a PDF filename."""
+    return sanitize_book_name(pdf_path.stem)
+
+
+def output_text_path(book_name: str, name: str, lang: str | None = None) -> Path:
+    """Return the output path for a text file for a specific book."""
+    if lang is None:
+        return OUTPUT_DIR / f"{book_name}_{name}.md"
+    return OUTPUT_DIR / f"{book_name}_{name}_{lang}.md"
+
+
+def output_audio_path(book_name: str, name: str, lang: str) -> Path:
+    """Return the output path for an audio file for a specific book."""
+    return OUTPUT_DIR / f"{book_name}_{name}_{lang}.mp3"
 
 
 # Names for the full-length TTS-preprocessed source

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from book_processing.config import (
+    BOOK_MAX_WORKERS,
     SUMMARY_TYPES,
     LANGUAGES,
     PODCAST_SPEAKERS,
@@ -12,8 +13,10 @@ from book_processing.config import (
     TTS_JOB_MAX_RETRIES,
     TTS_MAX_CHARS_PER_CHUNK,
     TTS_MAX_CONCURRENT_JOBS,
+    book_name_from_pdf,
     output_text_path,
     output_audio_path,
+    sanitize_book_name,
 )
 
 
@@ -55,17 +58,31 @@ def test_podcast_speakers():
 
 
 def test_output_text_path():
-    path = output_text_path("summary_2min", "en")
-    assert path.name == "summary_2min_en.md"
+    path = output_text_path("inference_engineering", "summary_2min", "en")
+    assert path.name == "inference_engineering_summary_2min_en.md"
     assert isinstance(path, Path)
 
 
 def test_output_audio_path():
-    path = output_audio_path("podcast_60min", "cs")
-    assert path.name == "podcast_60min_cs.mp3"
+    path = output_audio_path("inference_engineering", "podcast_60min", "cs")
+    assert path.name == "inference_engineering_podcast_60min_cs.mp3"
+
+
+def test_output_raw_text_path():
+    path = output_text_path("inference_engineering", "source_raw")
+    assert path.name == "inference_engineering_source_raw.md"
+
+
+def test_sanitize_book_name():
+    assert sanitize_book_name("Inference Engineering 2nd Edition") == "inference_engineering_2nd_edition"
+
+
+def test_book_name_from_pdf():
+    assert book_name_from_pdf(Path(r"C:\tmp\Inference Engineering.pdf")) == "inference_engineering"
 
 
 def test_parallelism_config():
+    assert BOOK_MAX_WORKERS >= 1
     assert LLM_MAX_WORKERS >= 1
     assert TTS_MAX_CONCURRENT_JOBS >= 1
 

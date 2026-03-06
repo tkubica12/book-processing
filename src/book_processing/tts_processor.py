@@ -29,8 +29,8 @@ from book_processing.config import (
     SUMMARY_TYPES,
     TTS_JOB_MAX_RETRIES,
     TTS_MAX_CONCURRENT_JOBS,
-    output_audio_path,
     output_text_path,
+    output_audio_path,
 )
 from book_processing.ssml_builder import build_chunked_ssml
 
@@ -129,7 +129,13 @@ def _check_job_status(client: httpx.Client, headers: dict[str, str], job_id: str
             error = data.get("properties", {}).get("error", "Unknown error")
             raise RuntimeError(f"Batch synthesis job {job_id} failed: {error}")
         return None
-    except (httpx.ConnectError, httpx.TimeoutException, OSError) as e:
+    except (
+        httpx.ConnectError,
+        httpx.TimeoutException,
+        httpx.RemoteProtocolError,
+        httpx.ReadError,
+        OSError,
+    ) as e:
         logger.warning("Poll error for %s: %s", job_id, e)
         return None
 
@@ -145,7 +151,12 @@ def _download_audio_bytes(client: httpx.Client, job_data: dict) -> bytes:
             response = client.get(result_url, follow_redirects=True, timeout=600)
             response.raise_for_status()
             break
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
+        except (
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+        ) as e:
             logger.warning("Download failed (attempt %d): %s", attempt + 1, e)
             if attempt == 2:
                 raise
@@ -190,7 +201,7 @@ class TtsJobTracker:
 
         tracker = TtsJobTracker()
         Thread(target=tracker.poll_loop).start()
-        tracker.enqueue("summary_2min", "en", path, is_podcast=False)
+        tracker.enqueue("book_name", "summary_2min", "en", path, is_podcast=False)
         tracker.finalize()
         tracker.wait()
         outputs = tracker.get_outputs()
@@ -207,10 +218,10 @@ class TtsJobTracker:
         self._assembly: dict[str, dict] = {}
         self._assembly_lock = threading.Lock()
 
-    def enqueue(self, name: str, lang: str, text_path: Path, is_podcast: bool) -> None:
+    def enqueue(self, book_name: str, name: str, lang: str, text_path: Path, is_podcast: bool) -> None:
         """Thread-safe: add a new TTS request to the processing queue."""
         self._pending.put({
-            "name": name, "lang": lang, "text_path": text_path, "is_podcast": is_podcast,
+            "book_name": book_name, "name": name, "lang": lang, "text_path": text_path, "is_podcast": is_podcast,
         })
 
     def finalize(self) -> None:
@@ -359,9 +370,9 @@ class TtsJobTracker:
         For files with multiple SSML chunks, each chunk becomes an independent
         parallel job for maximum throughput.
         """
-        name, lang = item["name"], item["lang"]
-        audio_path = output_audio_path(name, lang)
-        display = f"{name}_{lang}"
+        book_name, name, lang = item["book_name"], item["name"], item["lang"]
+        audio_path = output_audio_path(book_name, name, lang)
+        display = f"{book_name}_{name}_{lang}"
 
         if audio_path.exists() and audio_path.stat().st_size > 1000:
             logger.info("TTS already exists: %s", display)
@@ -410,23 +421,24 @@ class TtsJobTracker:
 # Standalone run() - scans output dir and processes all text files
 # ---------------------------------------------------------------------------
 
-def run(output_dir: Path = OUTPUT_DIR) -> dict[str, Path]:
+def run(book_names: list[str], output_dir: Path = OUTPUT_DIR) -> dict[str, Path]:
     """Process all available text files into audio (standalone mode)."""
     tracker = TtsJobTracker()
 
     poll_thread = threading.Thread(target=tracker.poll_loop, daemon=True)
     poll_thread.start()
 
-    for summary_type, spec in SUMMARY_TYPES.items():
-        for lang in LANGUAGES:
-            text_path = output_text_path(summary_type, lang)
-            if text_path.exists():
-                tracker.enqueue(summary_type, lang, text_path, spec["is_podcast"])
+    for book_name in book_names:
+        for summary_type, spec in SUMMARY_TYPES.items():
+            for lang in LANGUAGES:
+                text_path = output_text_path(book_name, summary_type, lang)
+                if text_path.exists():
+                    tracker.enqueue(book_name, summary_type, lang, text_path, spec["is_podcast"])
 
-    for lang in LANGUAGES:
-        text_path = output_text_path(SOURCE_TTS_NAME, lang)
-        if text_path.exists():
-            tracker.enqueue(SOURCE_TTS_NAME, lang, text_path, False)
+        for lang in LANGUAGES:
+            text_path = output_text_path(book_name, SOURCE_TTS_NAME, lang)
+            if text_path.exists():
+                tracker.enqueue(book_name, SOURCE_TTS_NAME, lang, text_path, False)
 
     tracker.finalize()
     tracker.wait()

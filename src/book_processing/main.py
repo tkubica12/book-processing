@@ -2,15 +2,25 @@
 
 Stages 2 (LLM) and 3 (TTS) run overlapped: TTS jobs are submitted as soon
 as each text file is ready, so audio synthesis happens concurrently with
-remaining LLM work.
+remaining LLM work. Multiple books are processed independently in parallel.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import threading
 import time
 from pathlib import Path
 
-from book_processing.config import INPUT_DIR, OUTPUT_DIR
+from book_processing.config import (
+    BOOK_MAX_WORKERS,
+    INPUT_DIR,
+    LANGUAGES,
+    OUTPUT_DIR,
+    SOURCE_TTS_NAME,
+    SUMMARY_TYPES,
+    output_audio_path,
+    output_text_path,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,7 +34,7 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     """Run the complete book processing pipeline.
 
     Stage 1: PDF -> Markdown (with post-processing cleanup)
-    Stage 2+3: LLM text generation and TTS audio generation run overlapped.
+    Stage 2+3: Per-book LLM text generation and shared TTS audio generation run overlapped.
     """
     pipeline_start = time.time()
     logger.info("=" * 60)
@@ -38,8 +48,8 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     t0 = time.time()
     from book_processing.pdf_converter import run as run_pdf
 
-    source_md_path = run_pdf(input_dir, output_dir)
-    logger.info("Stage 1 complete in %.0fs: %s", time.time() - t0, source_md_path)
+    book_sources = run_pdf(input_dir, output_dir)
+    logger.info("Stage 1 complete in %.0fs: %d books", time.time() - t0, len(book_sources))
 
     # --- Stage 2+3: Overlapped LLM + TTS ---
     logger.info("STAGE 2+3: LLM + TTS (overlapped)")
@@ -53,31 +63,47 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     tts_thread = threading.Thread(target=tracker.poll_loop, name="tts-poll", daemon=True)
     tts_thread.start()
 
-    def on_file_ready(name: str, lang: str, path: Path, is_podcast: bool) -> None:
+    def on_file_ready(book_name: str, name: str, lang: str, path: Path, is_podcast: bool) -> None:
         """Callback: immediately queue text file for TTS synthesis."""
-        logger.info("Text ready -> queuing TTS: %s_%s", name, lang)
-        tracker.enqueue(name, lang, path, is_podcast)
+        logger.info("Text ready -> queuing TTS: %s_%s_%s", book_name, name, lang)
+        tracker.enqueue(book_name, name, lang, path, is_podcast)
 
-    # Run LLM (blocking); each completed file triggers on_file_ready -> TTS
-    text_outputs = run_llm(source_md_path, output_dir, on_file_ready=on_file_ready)
+    def _run_book(book_name: str, source_md_path: Path) -> dict[str, Path]:
+        logger.info("Starting per-book LLM pipeline: %s", book_name)
+        return run_llm(book_name, source_md_path, output_dir, on_file_ready=on_file_ready)
+
+    # Run LLM for all books in parallel; each completed file triggers on_file_ready -> TTS
+    text_outputs: dict[str, Path] = {}
+    max_workers = min(BOOK_MAX_WORKERS, len(book_sources))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_run_book, book_name, source_md_path): book_name
+            for book_name, source_md_path in book_sources.items()
+        }
+        for future in as_completed(futures):
+            book_name = futures[future]
+            book_outputs = future.result()
+            text_outputs.update(book_outputs)
+            logger.info("LLM finished for %s: %d text files", book_name, len(book_outputs))
+
     llm_elapsed = time.time() - t0
-    logger.info("LLM complete in %.0fs: %d text files", llm_elapsed, len(text_outputs))
+    logger.info("LLM complete in %.0fs: %d text files across %d books", llm_elapsed, len(text_outputs), len(book_sources))
 
     # Queue any text files that already existed (skipped by LLM) but have no audio
-    from book_processing.config import SUMMARY_TYPES, LANGUAGES, SOURCE_TTS_NAME, output_audio_path, output_text_path
-    for stype, spec in SUMMARY_TYPES.items():
+    for book_name in book_sources:
+        for stype, spec in SUMMARY_TYPES.items():
+            for lang in LANGUAGES:
+                tp = output_text_path(book_name, stype, lang)
+                ap = output_audio_path(book_name, stype, lang)
+                if tp.exists() and not (ap.exists() and ap.stat().st_size > 1000):
+                    logger.info("Queuing existing text for TTS: %s_%s_%s", book_name, stype, lang)
+                    tracker.enqueue(book_name, stype, lang, tp, spec["is_podcast"])
         for lang in LANGUAGES:
-            tp = output_text_path(stype, lang)
-            ap = output_audio_path(stype, lang)
+            tp = output_text_path(book_name, SOURCE_TTS_NAME, lang)
+            ap = output_audio_path(book_name, SOURCE_TTS_NAME, lang)
             if tp.exists() and not (ap.exists() and ap.stat().st_size > 1000):
-                logger.info("Queuing existing text for TTS: %s_%s", stype, lang)
-                tracker.enqueue(stype, lang, tp, spec["is_podcast"])
-    for lang in LANGUAGES:
-        tp = output_text_path(SOURCE_TTS_NAME, lang)
-        ap = output_audio_path(SOURCE_TTS_NAME, lang)
-        if tp.exists() and not (ap.exists() and ap.stat().st_size > 1000):
-            logger.info("Queuing existing text for TTS: %s_%s", SOURCE_TTS_NAME, lang)
-            tracker.enqueue(SOURCE_TTS_NAME, lang, tp, False)
+                logger.info("Queuing existing text for TTS: %s_%s_%s", book_name, SOURCE_TTS_NAME, lang)
+                tracker.enqueue(book_name, SOURCE_TTS_NAME, lang, tp, False)
 
     # Signal TTS that no more files are coming, wait for remaining jobs
     tracker.finalize()

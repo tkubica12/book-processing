@@ -2,11 +2,19 @@
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from markitdown import MarkItDown
 
-from book_processing.config import INPUT_DIR, OUTPUT_DIR, SOURCE_RAW_NAME
+from book_processing.config import (
+    BOOK_MAX_WORKERS,
+    INPUT_DIR,
+    OUTPUT_DIR,
+    SOURCE_RAW_NAME,
+    book_name_from_pdf,
+    output_text_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,32 +122,32 @@ def clean_raw_markdown(text: str) -> str:
     return text.strip()
 
 
-def convert_all_pdfs(input_dir: Path = INPUT_DIR) -> str:
-    """Convert all PDFs in input_dir to Markdown and concatenate them.
+def _process_pdf(pdf_path: Path, output_dir: Path) -> tuple[str, Path]:
+    """Convert, clean, and save one PDF as its own raw markdown file."""
+    book_name = book_name_from_pdf(pdf_path)
+    md_text = convert_pdf_to_markdown(pdf_path)
+    cleaned_md = clean_raw_markdown(md_text)
+    output_path = output_text_path(book_name, SOURCE_RAW_NAME)
+    output_path.write_text(cleaned_md, encoding="utf-8")
+    logger.info("Saved raw Markdown for %s to %s (%d chars)", book_name, output_path, len(cleaned_md))
+    return book_name, output_path
 
-    Returns the full concatenated Markdown string.
-    """
+
+def run(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> dict[str, Path]:
+    """Run the PDF conversion stage for all books, returning per-book raw paths."""
+    output_dir.mkdir(parents=True, exist_ok=True)
     pdfs = find_pdfs(input_dir)
     if not pdfs:
         raise FileNotFoundError(f"No PDF files found in {input_dir}")
 
-    sections: list[str] = []
-    for pdf in pdfs:
-        md_text = convert_pdf_to_markdown(pdf)
-        sections.append(md_text)
+    outputs: dict[str, Path] = {}
+    max_workers = min(BOOK_MAX_WORKERS, len(pdfs))
+    logger.info("Processing %d PDF(s) as independent books with %d workers", len(pdfs), max_workers)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process_pdf, pdf, output_dir): pdf for pdf in pdfs}
+        for future in as_completed(futures):
+            book_name, output_path = future.result()
+            outputs[book_name] = output_path
 
-    combined = "\n\n---\n\n".join(sections)
-    logger.info("Combined %d PDF(s) into %d characters of Markdown", len(pdfs), len(combined))
-    return combined
-
-
-def run(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> Path:
-    """Run the full PDF conversion stage. Returns path to the output file."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    combined_md = convert_all_pdfs(input_dir)
-    cleaned_md = clean_raw_markdown(combined_md)
-
-    output_path = output_dir / f"{SOURCE_RAW_NAME}.md"
-    output_path.write_text(cleaned_md, encoding="utf-8")
-    logger.info("Saved raw Markdown to %s (%d chars)", output_path, len(cleaned_md))
-    return output_path
+    logger.info("Stage 1 produced %d per-book raw markdown file(s)", len(outputs))
+    return outputs
