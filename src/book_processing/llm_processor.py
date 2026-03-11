@@ -32,7 +32,20 @@ from book_processing.prompt_templates import render_prompt
 
 logger = logging.getLogger(__name__)
 
+
+class ContentFilterError(RuntimeError):
+    """Raised when Azure OpenAI rejects a prompt due to content filtering."""
+
+
+class LlmRequestTimeoutError(RuntimeError):
+    """Raised when an LLM request times out and should be adaptively split."""
+
+
 MAX_RETRIES = 8
+LLM_REQUEST_TIMEOUT_SECONDS = 300
+FILTER_RECOVERY_MAX_DEPTH = 6
+FILTER_RECOVERY_MIN_CHARS = 400
+FILTER_RECOVERY_MIN_WORDS = 60
 FILTER_REDACTIONS = {
     r"\bsex(?:ual|ually)?\b": "intimate",
     r"\bporn(?:ography)?\b": "adult material",
@@ -58,7 +71,7 @@ def _get_client() -> AzureOpenAI:
         api_version=AZURE_OPENAI_API_VERSION,
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
         azure_ad_token_provider=get_cognitive_token,
-        timeout=1200,
+        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         max_retries=0,
     )
 
@@ -77,7 +90,161 @@ def _sanitize_filtered_prompt(prompt: str) -> str:
     return sanitized
 
 
-def _call_llm(client: AzureOpenAI, system_prompt: str, user_prompt: str, max_tokens: int = 16000) -> str:
+def _is_timeout_error(error: Exception) -> bool:
+    """Return True when the client timed out waiting for Azure OpenAI."""
+    return "timed out" in str(error).lower()
+
+
+def _split_parts_near_half(parts: list[str], joiner: str) -> tuple[str, str] | None:
+    """Split a sequence into two roughly balanced, non-empty halves."""
+    if len(parts) < 2:
+        return None
+
+    total_length = sum(len(part) for part in parts)
+    best_index = None
+    best_diff = None
+    running_length = 0
+    for index, part in enumerate(parts[:-1], start=1):
+        running_length += len(part)
+        diff = abs((total_length - running_length) - running_length)
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best_index = index
+
+    if best_index is None:
+        return None
+
+    left = joiner.join(parts[:best_index]).strip()
+    right = joiner.join(parts[best_index:]).strip()
+    if not left or not right:
+        return None
+    return left, right
+
+
+def _split_text_for_filter_recovery(text: str) -> tuple[str, str] | None:
+    """Split text for adaptive content-filter recovery, preferring natural boundaries."""
+    normalized = text.strip()
+    if not normalized:
+        return None
+
+    paragraph_parts = [part.strip() for part in re.split(r"\n\s*\n+", normalized) if part.strip()]
+    paragraph_split = _split_parts_near_half(paragraph_parts, "\n\n")
+    if paragraph_split is not None:
+        return paragraph_split
+
+    sentence_parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
+    sentence_split = _split_parts_near_half(sentence_parts, " ")
+    if sentence_split is not None:
+        return sentence_split
+
+    word_parts = normalized.split()
+    return _split_parts_near_half(word_parts, " ")
+
+
+def _filtered_fragment_placeholder(lang: str) -> str:
+    """Return a spoken placeholder for a tiny fragment omitted due to content filtering."""
+    if lang == "cs":
+        return "Zde je vynechána krátká pasáž kvůli bezpečnostnímu filtrování obsahu."
+    return "A short passage is omitted here due to content safety filtering."
+
+
+def _recover_filtered_text(
+    client: AzureOpenAI,
+    system_prompt: str,
+    render_user_prompt: Callable[[str], str],
+    source_text: str,
+    lang: str,
+    partial_dir: Path,
+    cache_prefix: str,
+    max_tokens: int,
+    depth: int = 0,
+    fragment_path: str = "root",
+) -> str:
+    """Recursively recover from content-filtered prompts by splitting source text."""
+    partial_dir.mkdir(exist_ok=True)
+    cache_path = partial_dir / f"{cache_prefix}_recovery_{fragment_path}.md"
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        return cache_path.read_text(encoding="utf-8")
+
+    user_prompt = render_user_prompt(source_text)
+    try:
+        result = _call_llm(
+            client,
+            system_prompt,
+            user_prompt,
+            max_tokens=max_tokens,
+            split_on_timeout=True,
+        )
+    except (ContentFilterError, LlmRequestTimeoutError) as error:
+        is_timeout = isinstance(error, LlmRequestTimeoutError)
+        split_text = _split_text_for_filter_recovery(source_text)
+        is_irreducible = (
+            depth >= FILTER_RECOVERY_MAX_DEPTH
+            or len(source_text) <= FILTER_RECOVERY_MIN_CHARS
+            or len(source_text.split()) <= FILTER_RECOVERY_MIN_WORDS
+            or split_text is None
+        )
+        if is_irreducible:
+            if is_timeout:
+                raise
+            placeholder = _filtered_fragment_placeholder(lang)
+            logger.warning(
+                "Content filter persisted for %s fragment %s; inserting placeholder (%d chars, ~%d words).",
+                cache_prefix,
+                fragment_path,
+                len(source_text),
+                len(source_text.split()),
+            )
+            cache_path.write_text(placeholder, encoding="utf-8")
+            return placeholder
+
+        left_text, right_text = split_text
+        logger.warning(
+            "%s hit %s fragment %s; splitting at depth %d into %d and %d chars.",
+            "LLM timeout" if is_timeout else "Content filter",
+            cache_prefix,
+            fragment_path,
+            depth,
+            len(left_text),
+            len(right_text),
+        )
+        left_result = _recover_filtered_text(
+            client,
+            system_prompt,
+            render_user_prompt,
+            left_text,
+            lang,
+            partial_dir,
+            cache_prefix,
+            max_tokens,
+            depth + 1,
+            f"{fragment_path}a",
+        )
+        right_result = _recover_filtered_text(
+            client,
+            system_prompt,
+            render_user_prompt,
+            right_text,
+            lang,
+            partial_dir,
+            cache_prefix,
+            max_tokens,
+            depth + 1,
+            f"{fragment_path}b",
+        )
+        result = "\n\n".join(part for part in (left_result.strip(), right_result.strip()) if part)
+
+    cache_path.write_text(result, encoding="utf-8")
+    return result
+
+
+def _call_llm(
+    client: AzureOpenAI,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 16000,
+    split_on_timeout: bool = False,
+) -> str:
     """Make a single chat completion call with retry logic."""
     effective_max = max(max_tokens, 8000)
     current_user_prompt = user_prompt
@@ -109,15 +276,19 @@ def _call_llm(client: AzureOpenAI, system_prompt: str, user_prompt: str, max_tok
                 logger.warning("Response was empty - likely ran out of completion tokens.")
             return content
         except Exception as e:
-            if _is_content_filter_error(e) and not used_sanitized_prompt:
-                sanitized_prompt = _sanitize_filtered_prompt(current_user_prompt)
-                if sanitized_prompt != current_user_prompt:
-                    current_user_prompt = sanitized_prompt
-                    used_sanitized_prompt = True
-                    logger.warning(
-                        "LLM prompt hit content filter; retrying immediately with sanitized source text."
-                    )
-                    continue
+            if _is_content_filter_error(e):
+                if not used_sanitized_prompt:
+                    sanitized_prompt = _sanitize_filtered_prompt(current_user_prompt)
+                    if sanitized_prompt != current_user_prompt:
+                        current_user_prompt = sanitized_prompt
+                        used_sanitized_prompt = True
+                        logger.warning(
+                            "LLM prompt hit content filter; retrying immediately with sanitized source text."
+                        )
+                        continue
+                raise ContentFilterError("LLM prompt was blocked by Azure content filtering") from e
+            if split_on_timeout and _is_timeout_error(e):
+                raise LlmRequestTimeoutError("LLM request timed out while generating a chunk") from e
             wait = 30 * (attempt + 1)
             logger.warning("LLM call failed (attempt %d/%d): %s. Retrying in %ds...", attempt + 1, MAX_RETRIES, e, wait)
             time.sleep(wait)
@@ -223,13 +394,22 @@ def _do_tts_chunk(
     )
 
     logger.info("Processing TTS source chunk %d/%d for lang=%s...", chunk_num, total_chunks, lang)
-    user_prompt = render_prompt(
-        "tts_chunk_user.j2",
-        chunk_num=chunk_num,
-        total_chunks=total_chunks,
-        chunk_text=chunk_text,
+    cache_prefix = f"{book_name}_source_tts_{lang}_chunk{chunk_num}"
+    result = _recover_filtered_text(
+        client=client,
+        system_prompt=system_prompt,
+        render_user_prompt=lambda text: render_prompt(
+            "tts_chunk_user.j2",
+            chunk_num=chunk_num,
+            total_chunks=total_chunks,
+            chunk_text=text,
+        ),
+        source_text=chunk_text,
+        lang=lang,
+        partial_dir=partial_dir,
+        cache_prefix=cache_prefix,
+        max_tokens=16000,
     )
-    result = _call_llm(client, system_prompt, user_prompt, max_tokens=16000)
     if result:
         partial_path.write_text(result, encoding="utf-8")
     return result
