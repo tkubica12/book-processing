@@ -1,4 +1,4 @@
-# book-processing
+# Book processing
 
 Personal pipeline for turning long PDFs or Markdown files into a spiral learning workflow across reading and listening formats.
 
