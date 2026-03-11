@@ -1,12 +1,17 @@
 """Centralized configuration for the book processing pipeline."""
 
+import os
 import re
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # === Project Paths ===
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 INPUT_DIR = PROJECT_ROOT / "input"
 OUTPUT_DIR = PROJECT_ROOT / "output"
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 # === Azure OpenAI ===
 AZURE_OPENAI_ENDPOINT = "https://sw-v2-project-resource.cognitiveservices.azure.com"
@@ -17,6 +22,16 @@ AZURE_OPENAI_API_VERSION = "2025-04-01-preview"
 AZURE_SPEECH_ENDPOINT = "https://sw-v2-project-resource.cognitiveservices.azure.com"
 AZURE_SPEECH_API_VERSION = "2024-04-01"
 AZURE_COGNITIVE_SCOPE = "https://cognitiveservices.azure.com/.default"
+
+# === Azure Content Understanding ===
+CONTENT_UNDERSTANDING_ENDPOINT = os.getenv("CONTENT_UNDERSTANDING_ENDPOINT", "").strip()
+CONTENT_UNDERSTANDING_API_VERSION = os.getenv("CONTENT_UNDERSTANDING_API_VERSION", "2025-11-01").strip()
+CONTENT_UNDERSTANDING_ANALYZER_ID = os.getenv("CONTENT_UNDERSTANDING_ANALYZER_ID", "prebuilt-documentSearch").strip()
+CONTENT_UNDERSTANDING_API_KEY = os.getenv("CONTENT_UNDERSTANDING_API_KEY", "").strip()
+CONTENT_UNDERSTANDING_PROCESSING_LOCATION = os.getenv("CONTENT_UNDERSTANDING_PROCESSING_LOCATION", "").strip()
+CONTENT_UNDERSTANDING_POLL_INTERVAL_SECONDS = float(
+    os.getenv("CONTENT_UNDERSTANDING_POLL_INTERVAL_SECONDS", "2")
+)
 
 # === Voice Configuration ===
 # Dragon HD voices are multilingual — same voices for EN and CZ
@@ -82,14 +97,19 @@ TTS_MAX_CHARS_PER_CHUNK = 25_000  # Smaller chunks are more reliable for long-fo
 
 # === File Naming ===
 def sanitize_book_name(name: str) -> str:
-    """Convert a PDF stem into a filesystem-safe book identifier."""
+    """Convert a source filename stem into a filesystem-safe book identifier."""
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", name.strip()).strip("_")
     return normalized.lower() or "book"
 
 
+def book_name_from_source(source_path: Path) -> str:
+    """Return the sanitized book name derived from a source filename."""
+    return sanitize_book_name(source_path.stem)
+
+
 def book_name_from_pdf(pdf_path: Path) -> str:
     """Return the sanitized book name derived from a PDF filename."""
-    return sanitize_book_name(pdf_path.stem)
+    return book_name_from_source(pdf_path)
 
 
 def output_text_path(book_name: str, name: str, lang: str | None = None) -> Path:

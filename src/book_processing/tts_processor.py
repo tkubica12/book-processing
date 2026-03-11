@@ -16,11 +16,11 @@ from pathlib import Path
 from queue import Empty, Queue
 
 import httpx
-from azure.identity import DefaultAzureCredential
+from mutagen.id3 import COMM, ID3, TALB, TCON, TIT2, TLAN, TPE1
 
+from book_processing.auth import get_cognitive_token
 from book_processing.config import (
     AUDIO_OUTPUT_FORMAT,
-    AZURE_COGNITIVE_SCOPE,
     AZURE_SPEECH_ENDPOINT,
     AZURE_SPEECH_API_VERSION,
     LANGUAGES,
@@ -37,31 +37,20 @@ from book_processing.ssml_builder import build_chunked_ssml
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 10
-
-# Module-level cached credential and token
-_credential = DefaultAzureCredential()
-_cached_token: str | None = None
-_token_expires_on: float = 0.0
-_token_lock = threading.Lock()
+CONTENT_TITLE_LABELS = {
+    "summary_2min": "Summary 2 min",
+    "summary_5min": "Summary 5 min",
+    "summary_20min": "Summary 20 min",
+    "podcast_60min": "Podcast 60 min",
+    SOURCE_TTS_NAME: "Source TTS",
+}
 
 
 def _get_token() -> str:
-    """Get a cached access token, refreshing only when near expiry (5 min buffer)."""
-    global _cached_token, _token_expires_on
-    with _token_lock:
-        if _cached_token and time.time() < _token_expires_on - 300:
-            return _cached_token
-
-    # Refresh outside lock to avoid blocking other threads
+    """Get a cached access token for Azure Speech."""
     for attempt in range(5):
         try:
-            access_token = _credential.get_token(AZURE_COGNITIVE_SCOPE)
-            with _token_lock:
-                _cached_token = access_token.token
-                _token_expires_on = access_token.expires_on
-            logger.debug("Token refreshed (expires in %.0f min)",
-                         (_token_expires_on - time.time()) / 60)
-            return access_token.token
+            return get_cognitive_token()
         except Exception as e:
             wait = 10 * (attempt + 1)
             if attempt < 4:
@@ -74,6 +63,38 @@ def _get_token() -> str:
 
 def _auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def _display_book_title(book_name: str) -> str:
+    """Convert a sanitized book identifier into a readable title."""
+    return book_name.replace("_", " ").strip().title()
+
+
+def _build_audio_metadata(book_name: str, name: str, lang: str) -> dict[str, str]:
+    """Build user-facing MP3 metadata values for one output artifact."""
+    book_title = _display_book_title(book_name)
+    content_label = CONTENT_TITLE_LABELS.get(name, name.replace("_", " ").title())
+    return {
+        "title": f"{book_title} - {content_label} ({lang})",
+        "album": book_title,
+        "artist": "book-processing",
+        "language": lang,
+        "comment": f"{book_name}_{name}_{lang}",
+        "genre": "Speech",
+    }
+
+
+def _write_mp3_metadata(audio_path: Path, book_name: str, name: str, lang: str) -> None:
+    """Write ID3 metadata to a synthesized MP3 file."""
+    metadata = _build_audio_metadata(book_name, name, lang)
+    tags = ID3()
+    tags.add(TIT2(encoding=3, text=metadata["title"]))
+    tags.add(TALB(encoding=3, text=metadata["album"]))
+    tags.add(TPE1(encoding=3, text=metadata["artist"]))
+    tags.add(TLAN(encoding=3, text=[metadata["language"]]))
+    tags.add(TCON(encoding=3, text=metadata["genre"]))
+    tags.add(COMM(encoding=3, lang="eng", desc="source", text=metadata["comment"]))
+    tags.save(audio_path, v2_version=3)
 
 
 def _submit_batch_synthesis(
@@ -295,6 +316,7 @@ class TtsJobTracker:
         if parent is None:
             # Single-job file: write directly
             job["audio_path"].write_bytes(audio_bytes)
+            _write_mp3_metadata(job["audio_path"], job["book_name"], job["name"], job["lang"])
             self._completed[display] = job["audio_path"]
             logger.info("TTS done: %s (%.1f MB)", display,
                         job["audio_path"].stat().st_size / 1024 / 1024)
@@ -322,6 +344,8 @@ class TtsJobTracker:
         with open(audio_path, "wb") as f:
             for idx in range(entry["total"]):
                 f.write(entry["parts"][idx])
+
+        _write_mp3_metadata(audio_path, entry["book_name"], entry["name"], entry["lang"])
 
         size_mb = audio_path.stat().st_size / 1024 / 1024
         self._completed[display] = audio_path
@@ -391,6 +415,9 @@ class TtsJobTracker:
                 "job_id": job_id,
                 "display": display,
                 "audio_path": audio_path,
+                "book_name": book_name,
+                "name": name,
+                "lang": lang,
                 "ssml_inputs": ssml_chunks,
                 "retries": 0,
             })
@@ -402,6 +429,9 @@ class TtsJobTracker:
                     "total": len(ssml_chunks),
                     "parts": {},
                     "audio_path": audio_path,
+                    "book_name": book_name,
+                    "name": name,
+                    "lang": lang,
                 }
             for idx, ssml in enumerate(ssml_chunks):
                 chunk_display = f"{display}_chunk{idx + 1}"
@@ -410,6 +440,9 @@ class TtsJobTracker:
                     "job_id": job_id,
                     "display": chunk_display,
                     "audio_path": audio_path,
+                    "book_name": book_name,
+                    "name": name,
+                    "lang": lang,
                     "parent_display": display,
                     "chunk_idx": idx,
                     "ssml_inputs": [ssml],

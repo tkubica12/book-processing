@@ -1,1 +1,1 @@
-"""Book processing pipeline — PDF to audio summaries."""
+"""Book processing pipeline — PDF/Markdown to audio summaries."""

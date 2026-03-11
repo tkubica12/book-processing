@@ -4,6 +4,8 @@ from pathlib import Path
 
 from book_processing.config import (
     BOOK_MAX_WORKERS,
+    CONTENT_UNDERSTANDING_ANALYZER_ID,
+    CONTENT_UNDERSTANDING_API_VERSION,
     SUMMARY_TYPES,
     LANGUAGES,
     PODCAST_SPEAKERS,
@@ -13,6 +15,7 @@ from book_processing.config import (
     TTS_JOB_MAX_RETRIES,
     TTS_MAX_CHARS_PER_CHUNK,
     TTS_MAX_CONCURRENT_JOBS,
+    book_name_from_source,
     book_name_from_pdf,
     output_text_path,
     output_audio_path,
@@ -81,10 +84,19 @@ def test_book_name_from_pdf():
     assert book_name_from_pdf(Path(r"C:\tmp\Inference Engineering.pdf")) == "inference_engineering"
 
 
+def test_book_name_from_source_markdown():
+    assert book_name_from_source(Path(r"C:\tmp\Inference Engineering.md")) == "inference_engineering"
+
+
 def test_parallelism_config():
     assert BOOK_MAX_WORKERS >= 1
     assert LLM_MAX_WORKERS >= 1
     assert TTS_MAX_CONCURRENT_JOBS >= 1
+
+
+def test_content_understanding_defaults():
+    assert CONTENT_UNDERSTANDING_ANALYZER_ID == "prebuilt-documentSearch"
+    assert CONTENT_UNDERSTANDING_API_VERSION == "2025-11-01"
 
 
 def test_tts_reliability_config():

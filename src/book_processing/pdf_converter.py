@@ -1,17 +1,23 @@
-"""Convert PDF files to Markdown using markitdown, with post-processing."""
+"""Normalize input sources into per-book raw Markdown files."""
 
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from markitdown import MarkItDown
+import pymupdf
 
+from book_processing.content_understanding import (
+    ContentUnderstandingNoUsableMarkdownError,
+    analyze_image_to_markdown,
+    analyze_pdf_to_markdown,
+)
 from book_processing.config import (
     BOOK_MAX_WORKERS,
     INPUT_DIR,
     OUTPUT_DIR,
     SOURCE_RAW_NAME,
+    book_name_from_source,
     book_name_from_pdf,
     output_text_path,
 )
@@ -19,107 +25,100 @@ from book_processing.config import (
 logger = logging.getLogger(__name__)
 
 
-def find_pdfs(input_dir: Path = INPUT_DIR) -> list[Path]:
-    """Find all PDF files in the input directory, sorted alphabetically."""
-    pdfs = sorted(input_dir.glob("*.pdf"))
-    logger.info("Found %d PDF(s) in %s", len(pdfs), input_dir)
-    return pdfs
+def find_source_files(input_dir: Path = INPUT_DIR) -> list[Path]:
+    """Find all supported source files in the input directory, sorted alphabetically."""
+    sources = sorted([*input_dir.glob("*.md"), *input_dir.glob("*.pdf")])
+    logger.info("Found %d source file(s) in %s", len(sources), input_dir)
+    return sources
 
 
 def convert_pdf_to_markdown(pdf_path: Path) -> str:
     """Convert a single PDF file to Markdown text."""
     logger.info("Converting %s to Markdown...", pdf_path.name)
-    md = MarkItDown()
-    result = md.convert(str(pdf_path))
-    text = result.text_content
+    try:
+        text = analyze_pdf_to_markdown(pdf_path)
+    except ContentUnderstandingNoUsableMarkdownError:
+        logger.warning(
+            "Content Understanding returned no usable PDF markdown for %s; retrying via rendered page images",
+            pdf_path.name,
+        )
+        try:
+            text = _convert_pdf_pages_to_markdown(pdf_path)
+        except ContentUnderstandingNoUsableMarkdownError:
+            logger.warning(
+                "Rendered page fallback also returned no usable markdown for %s; using local PDF text extraction",
+                pdf_path.name,
+            )
+            text = _extract_pdf_text_locally(pdf_path)
     logger.info("Converted %s — %d characters", pdf_path.name, len(text))
     return text
 
 
+def _render_pdf_pages_to_png(pdf_path: Path) -> list[tuple[str, bytes]]:
+    """Render PDF pages to PNG bytes for image-based fallback analysis."""
+    page_images: list[tuple[str, bytes]] = []
+    with pymupdf.open(pdf_path) as document:
+        for page_number, page in enumerate(document, start=1):
+            pixmap = page.get_pixmap(dpi=150, alpha=False)
+            page_images.append((f"{pdf_path.stem}_page_{page_number}.png", pixmap.tobytes("png")))
+    return page_images
+
+
+def _convert_pdf_pages_to_markdown(pdf_path: Path) -> str:
+    """Retry PDF conversion by rendering each page to an image for analysis."""
+    page_markdown: list[str] = []
+    for image_name, image_bytes in _render_pdf_pages_to_png(pdf_path):
+        page_markdown.append(analyze_image_to_markdown(image_name, image_bytes).strip())
+
+    combined_markdown = "\n\n".join(markdown for markdown in page_markdown if markdown)
+    if not combined_markdown:
+        raise ContentUnderstandingNoUsableMarkdownError(
+            f"Rendered page fallback returned no markdown for {pdf_path.name}"
+        )
+    return combined_markdown
+
+
+def _extract_pdf_text_locally(pdf_path: Path) -> str:
+    """Extract plain text from a PDF locally as a last-resort fallback."""
+    pages: list[str] = []
+    with pymupdf.open(pdf_path) as document:
+        for page_number, page in enumerate(document, start=1):
+            page_text = page.get_text("text").strip()
+            if page_text:
+                pages.append(f"## Page {page_number}\n\n{page_text}")
+
+    combined_text = "\n\n".join(pages).strip()
+    if not combined_text:
+        raise RuntimeError(f"Local PDF text extraction returned no text for {pdf_path.name}")
+    return combined_text
+
+
 def clean_raw_markdown(text: str) -> str:
-    """Post-process markitdown output to produce clean Markdown.
+    """Post-process Content Understanding Markdown for downstream use.
 
-    Fixes common PDF-to-markdown artifacts:
-    - Removes front matter (title page, copyright, ISBN)
-    - Removes Table of Contents (dotted page number lines)
-    - Removes inline page headers/footers ("80  Chapter 3: Hardware")
-    - Fixes broken section headings split across lines
-    - Collapses excessive blank lines
+    Keeps the rich Markdown structure intact while removing noisy page metadata
+    comments and collapsing excess blank lines.
     """
-    lines = text.split("\n")
-
-    # --- Phase 1: Find and remove TOC block ---
-    # TOC lines have patterns like "Preface ...........9" or "Chapter 0: Inference ...15"
-    toc_start = None
-    toc_end = None
-    for i, line in enumerate(lines):
-        if re.match(r"^Table of Contents\s*$", line.strip()):
-            toc_start = i
-        if toc_start is not None and re.search(r"\.{3,}\s*\d+\s*$", line):
-            toc_end = i
-    # Also catch "X  Table of Contents" page header repeats
-    toc_pattern = re.compile(r"^\d+\s+Table of Contents\s*$|^Table of Contents\s+\d+\s*$")
-
-    # --- Phase 2: Remove front matter (before first chapter/preface heading) ---
-    content_start = 0
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        # Look for the first real chapter heading or "Preface" as standalone heading
-        if re.match(r"^(Preface|Chapter\s+\d+)", stripped) and not re.search(r"\.{3,}", stripped):
-            content_start = i
-            break
-
-    # --- Phase 3: Build cleaned output ---
-    # Page header/footer patterns: "80  Chapter 3: Hardware" or "Chapter 3: Hardware  80"
-    page_header_re = re.compile(
-        r"^\d{1,3}\s{2,}(Chapter\s+\d+|Preface|Table of Contents)"
-        r"|^(Chapter\s+\d+|Preface|Table of Contents)[:\s].*\s{2,}\d{1,3}\s*$"
-    )
-
-    cleaned: list[str] = []
-    for i, line in enumerate(lines):
-        # Skip everything before content start
-        if i < content_start:
-            continue
-        # Skip TOC block
-        if toc_start is not None and toc_start <= i <= (toc_end or toc_start):
-            continue
-        # Skip TOC page header repeats
-        if toc_pattern.match(line.strip()):
-            continue
-        # Skip page headers/footers
-        if page_header_re.match(line.strip()):
-            continue
-        # Skip standalone page numbers (just a number on its own line)
-        if re.match(r"^\s*\d{1,3}\s*$", line) and i > 0:
-            continue
-        cleaned.append(line)
-
-    text = "\n".join(cleaned)
-
-    # --- Phase 4: Fix broken headings ---
-    # Pattern: "2.3\n\nImage Generation Inference Mechanics" → "## 2.3 Image Generation..."
-    text = re.sub(
-        r"\n(\d+\.\d+(?:\.\d+)?)\s*\n\n\s*([A-Z])",
-        r"\n\1 \2",
-        text,
-    )
-
-    # --- Phase 5: Collapse excessive blank lines ---
+    text = re.sub(r"<!--\s*Page(?:Number|Header|Footer)=.*?-->", "", text)
+    text = re.sub(r"<!--\s*PageBreak\s*-->", "", text)
     text = re.sub(r"\n{4,}", "\n\n\n", text)
 
-    # --- Phase 6: Convert section headings to proper markdown ---
-    # "Chapter X: Title" → "# Chapter X: Title"
-    text = re.sub(r"^(Chapter\s+\d+:.*)$", r"# \1", text, flags=re.MULTILINE)
-    # "X.Y  Title" (section) → "## X.Y Title"
-    text = re.sub(r"^(\d+\.\d+)\s{2,}(.+)$", r"## \1 \2", text, flags=re.MULTILINE)
-    # "X.Y.Z  Title" (subsection) → "### X.Y.Z Title"
-    text = re.sub(r"^(\d+\.\d+\.\d+)\s{2,}(.+)$", r"### \1 \2", text, flags=re.MULTILINE)
-    # "Preface" → "# Preface"
-    text = re.sub(r"^(Preface)\s*$", r"# \1", text, flags=re.MULTILINE)
-
-    logger.info("Cleaned markdown: removed front matter and TOC, fixed headings")
+    logger.info("Cleaned markdown: removed page metadata comments and collapsed blank lines")
     return text.strip()
+
+
+def validate_unique_book_names(source_paths: list[Path]) -> None:
+    """Ensure source files map to unique sanitized book names."""
+    seen: dict[str, Path] = {}
+    for source_path in source_paths:
+        book_name = book_name_from_source(source_path)
+        previous = seen.get(book_name)
+        if previous is not None:
+            raise ValueError(
+                "Multiple input files resolve to the same book name "
+                f"'{book_name}': {previous.name} and {source_path.name}"
+            )
+        seen[book_name] = source_path
 
 
 def _process_pdf(pdf_path: Path, output_dir: Path) -> tuple[str, Path]:
@@ -127,24 +126,48 @@ def _process_pdf(pdf_path: Path, output_dir: Path) -> tuple[str, Path]:
     book_name = book_name_from_pdf(pdf_path)
     md_text = convert_pdf_to_markdown(pdf_path)
     cleaned_md = clean_raw_markdown(md_text)
-    output_path = output_text_path(book_name, SOURCE_RAW_NAME)
+    output_path = output_dir / output_text_path(book_name, SOURCE_RAW_NAME).name
     output_path.write_text(cleaned_md, encoding="utf-8")
     logger.info("Saved raw Markdown for %s to %s (%d chars)", book_name, output_path, len(cleaned_md))
     return book_name, output_path
 
 
+def _process_markdown(md_path: Path, output_dir: Path) -> tuple[str, Path]:
+    """Copy one Markdown source into the standard raw-markdown output location."""
+    book_name = book_name_from_source(md_path)
+    md_text = md_path.read_text(encoding="utf-8")
+    output_path = output_dir / output_text_path(book_name, SOURCE_RAW_NAME).name
+    output_path.write_text(md_text, encoding="utf-8")
+    logger.info("Copied Markdown source for %s to %s (%d chars)", book_name, output_path, len(md_text))
+    return book_name, output_path
+
+
+def _process_source(source_path: Path, output_dir: Path) -> tuple[str, Path]:
+    """Normalize one supported source file into the raw-markdown output location."""
+    suffix = source_path.suffix.lower()
+    if suffix == ".pdf":
+        return _process_pdf(source_path, output_dir)
+    if suffix == ".md":
+        return _process_markdown(source_path, output_dir)
+    raise ValueError(f"Unsupported source file type: {source_path}")
+
+
 def run(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> dict[str, Path]:
-    """Run the PDF conversion stage for all books, returning per-book raw paths."""
+    """Normalize all supported input files into per-book raw-markdown outputs."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    pdfs = find_pdfs(input_dir)
-    if not pdfs:
-        raise FileNotFoundError(f"No PDF files found in {input_dir}")
+    source_files = find_source_files(input_dir)
+    if not source_files:
+        raise FileNotFoundError(f"No supported input files found in {input_dir}")
+    validate_unique_book_names(source_files)
 
     outputs: dict[str, Path] = {}
-    max_workers = min(BOOK_MAX_WORKERS, len(pdfs))
-    logger.info("Processing %d PDF(s) as independent books with %d workers", len(pdfs), max_workers)
+    max_workers = min(BOOK_MAX_WORKERS, len(source_files))
+    logger.info("Processing %d source file(s) as independent books with %d workers", len(source_files), max_workers)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_process_pdf, pdf, output_dir): pdf for pdf in pdfs}
+        futures = {
+            pool.submit(_process_source, source_path, output_dir): source_path
+            for source_path in source_files
+        }
         for future in as_completed(futures):
             book_name, output_path = future.result()
             outputs[book_name] = output_path

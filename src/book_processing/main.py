@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     """Run the complete book processing pipeline.
 
-    Stage 1: PDF -> Markdown (with post-processing cleanup)
+    Stage 1: Normalize PDF/Markdown inputs into raw Markdown per book
     Stage 2+3: Per-book LLM text generation and shared TTS audio generation run overlapped.
     """
     pipeline_start = time.time()
@@ -43,8 +43,8 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     logger.info("Output: %s", output_dir)
     logger.info("=" * 60)
 
-    # --- Stage 1: PDF to Markdown ---
-    logger.info("STAGE 1: PDF -> Markdown")
+    # --- Stage 1: Input to raw Markdown ---
+    logger.info("STAGE 1: Input -> Raw Markdown")
     t0 = time.time()
     from book_processing.pdf_converter import run as run_pdf
 

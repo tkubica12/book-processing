@@ -1,0 +1,13 @@
+Create part {{ section_num }} of {{ total_sections }} of a technical podcast.
+{% if section_role == "opening" %}This is the OPENING segment - include a welcoming intro.
+{% elif section_role == "closing" %}This is the CLOSING segment - wrap up and say goodbye to listeners.
+{% else %}Jump straight into the content - no intro needed.
+{% endif %}
+Aim for up to {{ words_per_section }} words of dialogue.
+Do NOT exceed {{ max_words }} words.
+If the available material for this section is thin, end earlier and keep it tight rather than padding the dialogue.
+Cover the key topics in the source material below.
+
+SOURCE MATERIAL:
+
+{{ section_text }}
