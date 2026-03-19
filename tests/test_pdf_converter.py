@@ -6,17 +6,24 @@ import pytest
 
 from book_processing.content_understanding import ContentUnderstandingNoUsableMarkdownError
 from book_processing.config import SOURCE_RAW_NAME
-from book_processing.pdf_converter import convert_pdf_to_markdown, find_source_files, run, validate_unique_book_names
+from book_processing.pdf_converter import (
+    convert_epub_to_markdown,
+    convert_pdf_to_markdown,
+    find_source_files,
+    run,
+    validate_unique_book_names,
+)
 
 
-def test_find_source_files_returns_markdown_and_pdf(tmp_path: Path):
+def test_find_source_files_returns_supported_sources(tmp_path: Path):
+    (tmp_path / "book_0.epub").write_bytes(b"epub")
     (tmp_path / "book_b.pdf").write_bytes(b"%PDF-1.7")
     (tmp_path / "book_a.md").write_text("# Book A", encoding="utf-8")
     (tmp_path / "ignore.txt").write_text("ignored", encoding="utf-8")
 
     sources = find_source_files(tmp_path)
 
-    assert [path.name for path in sources] == ["book_a.md", "book_b.pdf"]
+    assert [path.name for path in sources] == ["book_0.epub", "book_a.md", "book_b.pdf"]
 
 
 def test_validate_unique_book_names_rejects_collisions(tmp_path: Path):
@@ -36,7 +43,7 @@ def test_run_copies_markdown_inputs_to_source_raw(tmp_path: Path):
     outputs = run(input_dir=input_dir, output_dir=output_dir)
 
     expected_book_name = "the_book"
-    expected_output = output_dir / f"{expected_book_name}_{SOURCE_RAW_NAME}.md"
+    expected_output = output_dir / expected_book_name / f"{expected_book_name}_{SOURCE_RAW_NAME}.md"
     assert outputs == {expected_book_name: expected_output}
     assert expected_output.read_text(encoding="utf-8") == "# Heading\n\nBody text."
 
@@ -55,9 +62,47 @@ def test_run_processes_pdf_via_converter(monkeypatch, tmp_path: Path):
 
     outputs = run(input_dir=input_dir, output_dir=output_dir)
 
-    expected_output = output_dir / "the_book_source_raw.md"
+    expected_output = output_dir / "the_book" / "the_book_source_raw.md"
     assert outputs == {"the_book": expected_output}
     assert expected_output.read_text(encoding="utf-8") == "# Converted\n\nBody"
+
+
+def test_run_processes_epub_via_markitdown(monkeypatch, tmp_path: Path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    epub_path = input_dir / "The Book.epub"
+    epub_path.write_bytes(b"epub")
+
+    monkeypatch.setattr(
+        "book_processing.pdf_converter.convert_epub_to_markdown",
+        lambda path: "# EPUB Title\n\nEPUB body",
+    )
+
+    outputs = run(input_dir=input_dir, output_dir=output_dir)
+
+    expected_output = output_dir / "the_book" / "the_book_source_raw.md"
+    assert outputs == {"the_book": expected_output}
+    assert expected_output.read_text(encoding="utf-8") == "# EPUB Title\n\nEPUB body"
+
+
+def test_convert_epub_to_markdown_uses_markitdown(monkeypatch, tmp_path: Path):
+    epub_path = tmp_path / "The Book.epub"
+    epub_path.write_bytes(b"epub")
+
+    class FakeResult:
+        text_content = "# Converted EPUB\n\nBody"
+
+    class FakeMarkItDown:
+        def convert(self, path: str) -> FakeResult:
+            assert path == str(epub_path)
+            return FakeResult()
+
+    monkeypatch.setattr("book_processing.pdf_converter.MarkItDown", FakeMarkItDown)
+
+    markdown = convert_epub_to_markdown(epub_path)
+
+    assert markdown == "# Converted EPUB\n\nBody"
 
 
 def test_convert_pdf_to_markdown_falls_back_to_rendered_pages(monkeypatch, tmp_path: Path):

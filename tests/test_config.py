@@ -15,6 +15,7 @@ from book_processing.config import (
     TTS_JOB_MAX_RETRIES,
     TTS_MAX_CHARS_PER_CHUNK,
     TTS_MAX_CONCURRENT_JOBS,
+    book_output_dir,
     book_name_from_source,
     book_name_from_pdf,
     output_text_path,
@@ -63,17 +64,20 @@ def test_podcast_speakers():
 def test_output_text_path():
     path = output_text_path("inference_engineering", "summary_2min", "en")
     assert path.name == "inference_engineering_summary_2min_en.md"
+    assert path.parent == book_output_dir("inference_engineering")
     assert isinstance(path, Path)
 
 
 def test_output_audio_path():
     path = output_audio_path("inference_engineering", "podcast_60min", "cs")
     assert path.name == "inference_engineering_podcast_60min_cs.mp3"
+    assert path.parent == book_output_dir("inference_engineering")
 
 
 def test_output_raw_text_path():
     path = output_text_path("inference_engineering", "source_raw")
     assert path.name == "inference_engineering_source_raw.md"
+    assert path.parent == book_output_dir("inference_engineering")
 
 
 def test_sanitize_book_name():

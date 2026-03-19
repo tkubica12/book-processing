@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     """Run the complete book processing pipeline.
 
-    Stage 1: Normalize PDF/Markdown inputs into raw Markdown per book
+    Stage 1: Normalize PDF/EPUB/Markdown inputs into raw Markdown per book
     Stage 2+3: Per-book LLM text generation and shared TTS audio generation run overlapped.
     """
     pipeline_start = time.time()
@@ -59,7 +59,7 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     from book_processing.tts_processor import TtsJobTracker
 
     # Create TTS tracker and start its polling loop in a background thread
-    tracker = TtsJobTracker()
+    tracker = TtsJobTracker(output_dir)
     tts_thread = threading.Thread(target=tracker.poll_loop, name="tts-poll", daemon=True)
     tts_thread.start()
 
@@ -93,14 +93,14 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     for book_name in book_sources:
         for stype, spec in SUMMARY_TYPES.items():
             for lang in LANGUAGES:
-                tp = output_text_path(book_name, stype, lang)
-                ap = output_audio_path(book_name, stype, lang)
+                tp = output_text_path(book_name, stype, lang, output_dir=output_dir)
+                ap = output_audio_path(book_name, stype, lang, output_dir=output_dir)
                 if tp.exists() and not (ap.exists() and ap.stat().st_size > 1000):
                     logger.info("Queuing existing text for TTS: %s_%s_%s", book_name, stype, lang)
                     tracker.enqueue(book_name, stype, lang, tp, spec["is_podcast"])
         for lang in LANGUAGES:
-            tp = output_text_path(book_name, SOURCE_TTS_NAME, lang)
-            ap = output_audio_path(book_name, SOURCE_TTS_NAME, lang)
+            tp = output_text_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
+            ap = output_audio_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
             if tp.exists() and not (ap.exists() and ap.stat().st_size > 1000):
                 logger.info("Queuing existing text for TTS: %s_%s_%s", book_name, SOURCE_TTS_NAME, lang)
                 tracker.enqueue(book_name, SOURCE_TTS_NAME, lang, tp, False)

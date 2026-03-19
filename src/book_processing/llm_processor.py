@@ -26,6 +26,7 @@ from book_processing.config import (
     PODCAST_SPEAKERS,
     SOURCE_TTS_NAME,
     SUMMARY_TYPES,
+    book_output_dir,
     output_text_path,
 )
 from book_processing.prompt_templates import render_prompt
@@ -161,7 +162,7 @@ def _recover_filtered_text(
     fragment_path: str = "root",
 ) -> str:
     """Recursively recover from content-filtered prompts by splitting source text."""
-    partial_dir.mkdir(exist_ok=True)
+    partial_dir.mkdir(parents=True, exist_ok=True)
     cache_path = partial_dir / f"{cache_prefix}_recovery_{fragment_path}.md"
     if cache_path.exists() and cache_path.stat().st_size > 0:
         return cache_path.read_text(encoding="utf-8")
@@ -332,8 +333,8 @@ def _do_podcast_section(
     words_per_section = target_words // total_sections
     section_num = section_idx + 1
 
-    partial_dir = output_dir / "_partial"
-    partial_dir.mkdir(exist_ok=True)
+    partial_dir = book_output_dir(book_name, output_dir) / "_partial"
+    partial_dir.mkdir(parents=True, exist_ok=True)
     partial_path = partial_dir / f"{book_name}_podcast_60min_{lang}_section{section_num}.md"
 
     if partial_path.exists() and partial_path.stat().st_size > 100:
@@ -379,8 +380,8 @@ def _do_tts_chunk(
     lang_label = LANGUAGES[lang]["label"]
     chunk_num = chunk_idx + 1
 
-    partial_dir = output_dir / "_partial"
-    partial_dir.mkdir(exist_ok=True)
+    partial_dir = book_output_dir(book_name, output_dir) / "_partial"
+    partial_dir.mkdir(parents=True, exist_ok=True)
     partial_path = partial_dir / f"{book_name}_source_tts_{lang}_chunk{chunk_num}.md"
 
     if partial_path.exists() and partial_path.stat().st_size > 100:
@@ -463,7 +464,7 @@ def run(
         if spec["is_podcast"]:
             continue
         for lang in LANGUAGES:
-            path = output_text_path(book_name, stype, lang)
+            path = output_text_path(book_name, stype, lang, output_dir=output_dir)
             key = f"{book_name}_{stype}_{lang}"
             if path.exists() and path.stat().st_size > 100:
                 logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
@@ -478,7 +479,7 @@ def run(
             })
 
     for lang in LANGUAGES:
-        path = output_text_path(book_name, "podcast_60min", lang)
+        path = output_text_path(book_name, "podcast_60min", lang, output_dir=output_dir)
         key = f"{book_name}_podcast_60min_{lang}"
         if path.exists() and path.stat().st_size > 100:
             logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
@@ -496,7 +497,7 @@ def run(
             })
 
     for lang in LANGUAGES:
-        path = output_text_path(book_name, SOURCE_TTS_NAME, lang)
+        path = output_text_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
         key = f"{book_name}_{SOURCE_TTS_NAME}_{lang}"
         if path.exists() and path.stat().st_size > 100:
             logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
@@ -529,6 +530,7 @@ def run(
         ttype = task["type"]
 
         if ttype == "simple_summary":
+            task["path"].parent.mkdir(parents=True, exist_ok=True)
             task["path"].write_text(text, encoding="utf-8")
             key = task["key"]
             with lock:
@@ -547,7 +549,8 @@ def run(
                         task["key"], len(text.split()), done_count, total)
             if done_count == total:
                 assembled = "\n\n".join(podcast_parts[lang][i] for i in range(total))
-                path = output_text_path(book_name, "podcast_60min", lang)
+                path = output_text_path(book_name, "podcast_60min", lang, output_dir=output_dir)
+                path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(assembled, encoding="utf-8")
                 key = f"{book_name}_podcast_60min_{lang}"
                 with lock:
@@ -567,7 +570,8 @@ def run(
                         task["key"], len(text.split()), done_count, total)
             if done_count == total:
                 assembled = "\n\n".join(tts_parts[lang][i] for i in range(total))
-                path = output_text_path(book_name, SOURCE_TTS_NAME, lang)
+                path = output_text_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
+                path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(assembled, encoding="utf-8")
                 key = f"{book_name}_{SOURCE_TTS_NAME}_{lang}"
                 with lock:

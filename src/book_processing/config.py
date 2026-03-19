@@ -93,6 +93,9 @@ BOOK_MAX_WORKERS = 2  # Concurrent books processed in parallel batches
 LLM_MAX_WORKERS = 6  # Concurrent LLM requests
 TTS_MAX_CONCURRENT_JOBS = 8  # Concurrent Batch Synthesis jobs
 TTS_JOB_MAX_RETRIES = 3  # Retries per submitted batch job before failing
+TTS_JOB_STALE_AFTER_SECONDS = int(
+    os.getenv("TTS_JOB_STALE_AFTER_SECONDS", "600")
+)  # Retry batch jobs that stay running for too long
 TTS_MAX_CHARS_PER_CHUNK = 25_000  # Smaller chunks are more reliable for long-form TTS
 
 # === File Naming ===
@@ -112,16 +115,27 @@ def book_name_from_pdf(pdf_path: Path) -> str:
     return book_name_from_source(pdf_path)
 
 
-def output_text_path(book_name: str, name: str, lang: str | None = None) -> Path:
+def book_output_dir(book_name: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    """Return the output directory for a specific book."""
+    return output_dir / book_name
+
+
+def output_text_path(
+    book_name: str,
+    name: str,
+    lang: str | None = None,
+    output_dir: Path = OUTPUT_DIR,
+) -> Path:
     """Return the output path for a text file for a specific book."""
+    book_dir = book_output_dir(book_name, output_dir)
     if lang is None:
-        return OUTPUT_DIR / f"{book_name}_{name}.md"
-    return OUTPUT_DIR / f"{book_name}_{name}_{lang}.md"
+        return book_dir / f"{book_name}_{name}.md"
+    return book_dir / f"{book_name}_{name}_{lang}.md"
 
 
-def output_audio_path(book_name: str, name: str, lang: str) -> Path:
+def output_audio_path(book_name: str, name: str, lang: str, output_dir: Path = OUTPUT_DIR) -> Path:
     """Return the output path for an audio file for a specific book."""
-    return OUTPUT_DIR / f"{book_name}_{name}_{lang}.mp3"
+    return book_output_dir(book_name, output_dir) / f"{book_name}_{name}_{lang}.mp3"
 
 
 # Names for the full-length TTS-preprocessed source

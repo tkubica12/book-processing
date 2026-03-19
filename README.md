@@ -1,6 +1,6 @@
 # Book processing
 
-Personal pipeline for turning long PDFs or Markdown files into a spiral learning workflow across reading and listening formats.
+Personal pipeline for turning long PDFs, EPUBs, or Markdown files into a spiral learning workflow across reading and listening formats.
 
 The main goal is not generic document processing. It is to help me move through a book in layers so I can both save time and understand the material better by getting the high-level context first, before diving into details and losing the forest for the trees.
 
@@ -28,6 +28,7 @@ That cleaned-up Markdown output serves a different purpose: it becomes a high-qu
 Each file in `input\` is treated as a separate book.
 
 - PDFs are extracted into Markdown with Azure Content Understanding, including document cleanup and richer structure from the source.
+- EPUB inputs are converted into Markdown with MarkItDown and then fed into the same raw source flow.
 - Markdown inputs are normalized into the same raw source flow so everything downstream behaves the same way.
 - LLM processing generates summaries, translations, podcast-style scripts, and full-length text adapted for speech.
 - Text-to-speech generates matching audio files for the same hierarchy of outputs.
@@ -36,30 +37,31 @@ In practice, this means a single source document becomes multiple entry points i
 
 ## Output structure
 
-Each output filename uses the sanitized source filename stem. For example, `Inference Engineering.pdf` becomes `inference_engineering_*`.
+Each book gets its own subfolder named after the sanitized source filename stem. For example, `Inference Engineering.pdf` becomes `output\inference_engineering\...`.
 
 Text outputs per book:
 
-- `output\<book_name>_source_raw.md`
-- `output\<book_name>_summary_2min_en.md`, `output\<book_name>_summary_2min_cs.md`
-- `output\<book_name>_summary_5min_en.md`, `output\<book_name>_summary_5min_cs.md`
-- `output\<book_name>_summary_20min_en.md`, `output\<book_name>_summary_20min_cs.md`
-- `output\<book_name>_podcast_60min_en.md`, `output\<book_name>_podcast_60min_cs.md`
-- `output\<book_name>_source_tts_en.md`, `output\<book_name>_source_tts_cs.md`
+- `output\<book_name>\<book_name>_source_raw.md`
+- `output\<book_name>\<book_name>_summary_2min_en.md`, `output\<book_name>\<book_name>_summary_2min_cs.md`
+- `output\<book_name>\<book_name>_summary_5min_en.md`, `output\<book_name>\<book_name>_summary_5min_cs.md`
+- `output\<book_name>\<book_name>_summary_20min_en.md`, `output\<book_name>\<book_name>_summary_20min_cs.md`
+- `output\<book_name>\<book_name>_podcast_60min_en.md`, `output\<book_name>\<book_name>_podcast_60min_cs.md`
+- `output\<book_name>\<book_name>_source_tts_en.md`, `output\<book_name>\<book_name>_source_tts_cs.md`
 
 Audio outputs per book:
 
-- `output\<book_name>_summary_2min_en.mp3`, `output\<book_name>_summary_2min_cs.mp3`
-- `output\<book_name>_summary_5min_en.mp3`, `output\<book_name>_summary_5min_cs.mp3`
-- `output\<book_name>_summary_20min_en.mp3`, `output\<book_name>_summary_20min_cs.mp3`
-- `output\<book_name>_podcast_60min_en.mp3`, `output\<book_name>_podcast_60min_cs.mp3`
-- `output\<book_name>_source_tts_en.mp3`, `output\<book_name>_source_tts_cs.mp3`
+- `output\<book_name>\<book_name>_summary_2min_en.mp3`, `output\<book_name>\<book_name>_summary_2min_cs.mp3`
+- `output\<book_name>\<book_name>_summary_5min_en.mp3`, `output\<book_name>\<book_name>_summary_5min_cs.mp3`
+- `output\<book_name>\<book_name>_summary_20min_en.mp3`, `output\<book_name>\<book_name>_summary_20min_cs.mp3`
+- `output\<book_name>\<book_name>_podcast_60min_en.mp3`, `output\<book_name>\<book_name>_podcast_60min_cs.mp3`
+- `output\<book_name>\<book_name>_source_tts_en.mp3`, `output\<book_name>\<book_name>_source_tts_cs.mp3`
 
 ## Very short technical summary
 
 This project uses:
 
 - Azure Content Understanding for PDF to Markdown extraction and cleanup
+- MarkItDown for EPUB to Markdown conversion
 - Azure OpenAI for summarization, translation, and podcast/text generation
 - Azure Speech Batch Synthesis for audio generation
 - `uv` for Python environment and dependency management
@@ -92,7 +94,7 @@ uv sync
 
 ## Very short run
 
-Put one or more `.pdf` or `.md` files into `input\`, then run:
+Put one or more `.pdf`, `.epub`, or `.md` files into `input\`, then run:
 
 ```powershell
 uv run book-processing

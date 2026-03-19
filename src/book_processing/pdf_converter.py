@@ -5,6 +5,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from markitdown import MarkItDown
 import pymupdf
 
 from book_processing.content_understanding import (
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 def find_source_files(input_dir: Path = INPUT_DIR) -> list[Path]:
     """Find all supported source files in the input directory, sorted alphabetically."""
-    sources = sorted([*input_dir.glob("*.md"), *input_dir.glob("*.pdf")])
+    sources = sorted([*input_dir.glob("*.epub"), *input_dir.glob("*.md"), *input_dir.glob("*.pdf")])
     logger.info("Found %d source file(s) in %s", len(sources), input_dir)
     return sources
 
@@ -52,6 +53,17 @@ def convert_pdf_to_markdown(pdf_path: Path) -> str:
             text = _extract_pdf_text_locally(pdf_path)
     logger.info("Converted %s — %d characters", pdf_path.name, len(text))
     return text
+
+
+def convert_epub_to_markdown(epub_path: Path) -> str:
+    """Convert a single EPUB file to Markdown text."""
+    logger.info("Converting %s to Markdown via MarkItDown...", epub_path.name)
+    result = MarkItDown().convert(str(epub_path))
+    markdown = result.text_content.strip()
+    if not markdown:
+        raise RuntimeError(f"MarkItDown returned no markdown for {epub_path.name}")
+    logger.info("Converted %s via MarkItDown — %d characters", epub_path.name, len(markdown))
+    return markdown
 
 
 def _render_pdf_pages_to_png(pdf_path: Path) -> list[tuple[str, bytes]]:
@@ -121,12 +133,18 @@ def validate_unique_book_names(source_paths: list[Path]) -> None:
         seen[book_name] = source_path
 
 
+def _raw_output_path(book_name: str, output_dir: Path) -> Path:
+    """Return the per-book source_raw path for one normalized source."""
+    return output_text_path(book_name, SOURCE_RAW_NAME, output_dir=output_dir)
+
+
 def _process_pdf(pdf_path: Path, output_dir: Path) -> tuple[str, Path]:
     """Convert, clean, and save one PDF as its own raw markdown file."""
     book_name = book_name_from_pdf(pdf_path)
     md_text = convert_pdf_to_markdown(pdf_path)
     cleaned_md = clean_raw_markdown(md_text)
-    output_path = output_dir / output_text_path(book_name, SOURCE_RAW_NAME).name
+    output_path = _raw_output_path(book_name, output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(cleaned_md, encoding="utf-8")
     logger.info("Saved raw Markdown for %s to %s (%d chars)", book_name, output_path, len(cleaned_md))
     return book_name, output_path
@@ -136,15 +154,29 @@ def _process_markdown(md_path: Path, output_dir: Path) -> tuple[str, Path]:
     """Copy one Markdown source into the standard raw-markdown output location."""
     book_name = book_name_from_source(md_path)
     md_text = md_path.read_text(encoding="utf-8")
-    output_path = output_dir / output_text_path(book_name, SOURCE_RAW_NAME).name
+    output_path = _raw_output_path(book_name, output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(md_text, encoding="utf-8")
     logger.info("Copied Markdown source for %s to %s (%d chars)", book_name, output_path, len(md_text))
+    return book_name, output_path
+
+
+def _process_epub(epub_path: Path, output_dir: Path) -> tuple[str, Path]:
+    """Convert one EPUB source into the standard raw-markdown output location."""
+    book_name = book_name_from_source(epub_path)
+    md_text = convert_epub_to_markdown(epub_path)
+    output_path = _raw_output_path(book_name, output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(md_text, encoding="utf-8")
+    logger.info("Converted EPUB source for %s to %s (%d chars)", book_name, output_path, len(md_text))
     return book_name, output_path
 
 
 def _process_source(source_path: Path, output_dir: Path) -> tuple[str, Path]:
     """Normalize one supported source file into the raw-markdown output location."""
     suffix = source_path.suffix.lower()
+    if suffix == ".epub":
+        return _process_epub(source_path, output_dir)
     if suffix == ".pdf":
         return _process_pdf(source_path, output_dir)
     if suffix == ".md":

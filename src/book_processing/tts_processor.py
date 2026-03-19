@@ -28,6 +28,7 @@ from book_processing.config import (
     SOURCE_TTS_NAME,
     SUMMARY_TYPES,
     TTS_JOB_MAX_RETRIES,
+    TTS_JOB_STALE_AFTER_SECONDS,
     TTS_MAX_CONCURRENT_JOBS,
     output_text_path,
     output_audio_path,
@@ -95,6 +96,16 @@ def _write_mp3_metadata(audio_path: Path, book_name: str, name: str, lang: str) 
     tags.add(TCON(encoding=3, text=metadata["genre"]))
     tags.add(COMM(encoding=3, lang="eng", desc="source", text=metadata["comment"]))
     tags.save(audio_path, v2_version=3)
+
+
+def _job_has_gone_stale(job: dict, now: float | None = None) -> bool:
+    """Return whether a submitted Azure batch job has exceeded the retry window."""
+    submitted_at = job.get("submitted_at")
+    if submitted_at is None:
+        return False
+
+    current_time = time.monotonic() if now is None else now
+    return current_time - submitted_at >= TTS_JOB_STALE_AFTER_SECONDS
 
 
 def _submit_batch_synthesis(
@@ -228,7 +239,8 @@ class TtsJobTracker:
         outputs = tracker.get_outputs()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, output_dir: Path = OUTPUT_DIR) -> None:
+        self._output_dir = output_dir
         self._pending: Queue[dict | None] = Queue()
         self._active: list[dict] = []      # individual chunk jobs
         self._completed: dict[str, Path] = {}
@@ -258,6 +270,72 @@ class TtsJobTracker:
     def get_outputs(self) -> dict[str, Path]:
         return dict(self._completed)
 
+    def _has_pending_chunk_jobs(self) -> bool:
+        """Return whether any chunked TTS work is queued but not yet submitted."""
+        with self._assembly_lock:
+            return any(entry.get("pending_chunks") for entry in self._assembly.values())
+
+    def _submit_chunk_job(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        entry: dict,
+        parent_display: str,
+        chunk_idx: int,
+        ssml: str,
+    ) -> None:
+        """Submit one queued chunk job for a larger TTS artifact."""
+        chunk_display = f"{parent_display}_chunk{chunk_idx + 1}"
+        job_id = _submit_batch_synthesis(client, headers, [ssml], chunk_display)
+        self._active.append({
+            "job_id": job_id,
+            "display": chunk_display,
+            "audio_path": entry["audio_path"],
+            "book_name": entry["book_name"],
+            "name": entry["name"],
+            "lang": entry["lang"],
+            "parent_display": parent_display,
+            "chunk_idx": chunk_idx,
+            "ssml_inputs": [ssml],
+            "retries": 0,
+            "submitted_at": time.monotonic(),
+        })
+
+    def _submit_pending_chunks(self, client: httpx.Client) -> bool:
+        """Submit queued chunk jobs until the active-job limit is reached."""
+        submitted_any = False
+        token: str | None = None
+        headers: dict[str, str] | None = None
+
+        while len(self._active) < TTS_MAX_CONCURRENT_JOBS:
+            next_chunk: tuple[str, int, str] | None = None
+            with self._assembly_lock:
+                for parent_display, entry in self._assembly.items():
+                    pending_chunks = entry.get("pending_chunks", [])
+                    if pending_chunks:
+                        chunk_idx, ssml = pending_chunks[0]
+                        next_chunk = (parent_display, chunk_idx, ssml)
+                        break
+
+            if next_chunk is None:
+                break
+
+            if headers is None:
+                token = _get_token()
+                headers = _auth_headers(token)
+
+            parent_display, chunk_idx, ssml = next_chunk
+            with self._assembly_lock:
+                entry = self._assembly[parent_display]
+            self._submit_chunk_job(client, headers, entry, parent_display, chunk_idx, ssml)
+            with self._assembly_lock:
+                pending_chunks = self._assembly[parent_display]["pending_chunks"]
+                if pending_chunks and pending_chunks[0][0] == chunk_idx:
+                    pending_chunks.pop(0)
+            submitted_any = True
+
+        return submitted_any
+
     def poll_loop(self) -> None:
         """Main processing loop: dequeue, submit, poll, download."""
         client = httpx.Client(timeout=300)
@@ -268,7 +346,9 @@ class TtsJobTracker:
                     try:
                         item = self._pending.get_nowait()
                     except Empty:
-                        break
+                        if not self._submit_pending_chunks(client):
+                            break
+                        continue
                     if item is None:
                         continue
                     self._submit_item(client, item)
@@ -285,14 +365,29 @@ class TtsJobTracker:
                             if self._retry_failed_job(client, headers, job, exc):
                                 continue
                             raise
-                        if data is not None:
-                            self._handle_completed_job(client, headers, job, data)
-                            completed.append(job)
+                        if data is None:
+                            if _job_has_gone_stale(job):
+                                timeout_error = RuntimeError(
+                                    "Batch synthesis job "
+                                    f"{job['display']} exceeded {TTS_JOB_STALE_AFTER_SECONDS}s without completing"
+                                )
+                                if self._retry_failed_job(client, headers, job, timeout_error):
+                                    continue
+                                raise timeout_error
+                            continue
+
+                        self._handle_completed_job(client, headers, job, data)
+                        completed.append(job)
                     for job in completed:
                         self._active.remove(job)
 
                 # Check exit condition
-                if self._finalized.is_set() and self._pending.empty() and not self._active:
+                if (
+                    self._finalized.is_set()
+                    and self._pending.empty()
+                    and not self._active
+                    and not self._has_pending_chunk_jobs()
+                ):
                     break
 
                 time.sleep(POLL_INTERVAL_SECONDS)
@@ -315,6 +410,7 @@ class TtsJobTracker:
         parent = job.get("parent_display")
         if parent is None:
             # Single-job file: write directly
+            job["audio_path"].parent.mkdir(parents=True, exist_ok=True)
             job["audio_path"].write_bytes(audio_bytes)
             _write_mp3_metadata(job["audio_path"], job["book_name"], job["name"], job["lang"])
             self._completed[display] = job["audio_path"]
@@ -341,6 +437,7 @@ class TtsJobTracker:
         audio_path = entry["audio_path"]
 
         logger.info("Assembling %d chunks for %s...", entry["total"], display)
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
         with open(audio_path, "wb") as f:
             for idx in range(entry["total"]):
                 f.write(entry["parts"][idx])
@@ -386,6 +483,7 @@ class TtsJobTracker:
             display,
         )
         job["retries"] = retries + 1
+        job["submitted_at"] = time.monotonic()
         return True
 
     def _submit_item(self, client: httpx.Client, item: dict) -> None:
@@ -395,7 +493,7 @@ class TtsJobTracker:
         parallel job for maximum throughput.
         """
         book_name, name, lang = item["book_name"], item["name"], item["lang"]
-        audio_path = output_audio_path(book_name, name, lang)
+        audio_path = output_audio_path(book_name, name, lang, output_dir=self._output_dir)
         display = f"{book_name}_{name}_{lang}"
 
         if audio_path.exists() and audio_path.stat().st_size > 1000:
@@ -405,11 +503,11 @@ class TtsJobTracker:
 
         text = item["text_path"].read_text(encoding="utf-8")
         ssml_chunks = build_chunked_ssml(text, lang, is_podcast=item["is_podcast"])
-        token = _get_token()
-        headers = _auth_headers(token)
 
         if len(ssml_chunks) == 1:
             # Small file: single job
+            token = _get_token()
+            headers = _auth_headers(token)
             job_id = _submit_batch_synthesis(client, headers, ssml_chunks, display)
             self._active.append({
                 "job_id": job_id,
@@ -420,6 +518,7 @@ class TtsJobTracker:
                 "lang": lang,
                 "ssml_inputs": ssml_chunks,
                 "retries": 0,
+                "submitted_at": time.monotonic(),
             })
         else:
             # Large file: one independent job per chunk for parallel synthesis
@@ -432,22 +531,9 @@ class TtsJobTracker:
                     "book_name": book_name,
                     "name": name,
                     "lang": lang,
+                    "pending_chunks": list(enumerate(ssml_chunks)),
                 }
-            for idx, ssml in enumerate(ssml_chunks):
-                chunk_display = f"{display}_chunk{idx + 1}"
-                job_id = _submit_batch_synthesis(client, headers, [ssml], chunk_display)
-                self._active.append({
-                    "job_id": job_id,
-                    "display": chunk_display,
-                    "audio_path": audio_path,
-                    "book_name": book_name,
-                    "name": name,
-                    "lang": lang,
-                    "parent_display": display,
-                    "chunk_idx": idx,
-                    "ssml_inputs": [ssml],
-                    "retries": 0,
-                })
+            self._submit_pending_chunks(client)
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +542,7 @@ class TtsJobTracker:
 
 def run(book_names: list[str], output_dir: Path = OUTPUT_DIR) -> dict[str, Path]:
     """Process all available text files into audio (standalone mode)."""
-    tracker = TtsJobTracker()
+    tracker = TtsJobTracker(output_dir)
 
     poll_thread = threading.Thread(target=tracker.poll_loop, daemon=True)
     poll_thread.start()
@@ -464,12 +550,12 @@ def run(book_names: list[str], output_dir: Path = OUTPUT_DIR) -> dict[str, Path]
     for book_name in book_names:
         for summary_type, spec in SUMMARY_TYPES.items():
             for lang in LANGUAGES:
-                text_path = output_text_path(book_name, summary_type, lang)
+                text_path = output_text_path(book_name, summary_type, lang, output_dir=output_dir)
                 if text_path.exists():
                     tracker.enqueue(book_name, summary_type, lang, text_path, spec["is_podcast"])
 
         for lang in LANGUAGES:
-            text_path = output_text_path(book_name, SOURCE_TTS_NAME, lang)
+            text_path = output_text_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
             if text_path.exists():
                 tracker.enqueue(book_name, SOURCE_TTS_NAME, lang, text_path, False)
 

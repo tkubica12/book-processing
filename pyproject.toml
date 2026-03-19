@@ -12,6 +12,7 @@ dependencies = [
     "mutagen",
     "python-dotenv",
     "pymupdf>=1.27.2",
+    "markitdown>=0.1.5",
 ]
 
 [project.scripts]
