@@ -2,10 +2,12 @@
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from book_processing.content_understanding import ContentUnderstandingNoUsableMarkdownError
-from book_processing.config import SOURCE_RAW_NAME
+from book_processing.config import SOURCE_RAW_NAME, wiki_text_path
+from book_processing.audio_transcriber import InvalidAudioSourceError
 from book_processing.pdf_converter import (
     convert_epub_to_markdown,
     convert_pdf_to_markdown,
@@ -19,11 +21,38 @@ def test_find_source_files_returns_supported_sources(tmp_path: Path):
     (tmp_path / "book_0.epub").write_bytes(b"epub")
     (tmp_path / "book_b.pdf").write_bytes(b"%PDF-1.7")
     (tmp_path / "book_a.md").write_text("# Book A", encoding="utf-8")
-    (tmp_path / "ignore.txt").write_text("ignored", encoding="utf-8")
+    (tmp_path / "book_a_text.txt").write_text("Book text", encoding="utf-8")
+    (tmp_path / "book_c.mp3").write_bytes(b"mp3")
+    (tmp_path / "book_d.m4b").write_bytes(b"m4b")
+    (tmp_path / "ignore.docx").write_text("ignored", encoding="utf-8")
 
     sources = find_source_files(tmp_path)
 
-    assert [path.name for path in sources] == ["book_0.epub", "book_a.md", "book_b.pdf"]
+    assert [path.name for path in sources] == [
+        "book_0.epub",
+        "book_a.md",
+        "book_a_text.txt",
+        "book_b.pdf",
+        "book_c.mp3",
+        "book_d.m4b",
+    ]
+
+
+def test_find_source_files_includes_audio_directories_with_supported_audio_only(tmp_path: Path):
+    audio_dir = tmp_path / "Podcast 10"
+    audio_dir.mkdir()
+    (audio_dir / "Track 10.mp3").write_bytes(b"mp3")
+    (audio_dir / "Track 2.m4b").write_bytes(b"m4b")
+    (audio_dir / "cover.jpg").write_bytes(b"jpg")
+    (audio_dir / "notes.txt").write_text("ignored", encoding="utf-8")
+
+    ignored_dir = tmp_path / "Scans"
+    ignored_dir.mkdir()
+    (ignored_dir / "page01.jpg").write_bytes(b"jpg")
+
+    sources = find_source_files(tmp_path)
+
+    assert [path.name for path in sources] == ["Podcast 10"]
 
 
 def test_validate_unique_book_names_rejects_collisions(tmp_path: Path):
@@ -44,8 +73,27 @@ def test_run_copies_markdown_inputs_to_source_raw(tmp_path: Path):
 
     expected_book_name = "the_book"
     expected_output = output_dir / expected_book_name / f"{expected_book_name}_{SOURCE_RAW_NAME}.md"
+    expected_wiki = wiki_text_path(expected_book_name, output_dir=output_dir)
     assert outputs == {expected_book_name: expected_output}
     assert expected_output.read_text(encoding="utf-8") == "# Heading\n\nBody text."
+    assert expected_wiki.read_text(encoding="utf-8") == "# Heading\n\nBody text."
+
+
+def test_run_copies_text_inputs_to_source_raw_and_wiki(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    text_path = input_dir / "The Book.txt"
+    text_path.write_text("Plain body text.", encoding="utf-8")
+
+    outputs = run(input_dir=input_dir, output_dir=output_dir)
+
+    expected_book_name = "the_book"
+    expected_output = output_dir / expected_book_name / f"{expected_book_name}_{SOURCE_RAW_NAME}.md"
+    expected_wiki = wiki_text_path(expected_book_name, output_dir=output_dir)
+    assert outputs == {expected_book_name: expected_output}
+    assert expected_output.read_text(encoding="utf-8") == "Plain body text."
+    assert expected_wiki.read_text(encoding="utf-8") == "Plain body text."
 
 
 def test_run_processes_pdf_via_converter(monkeypatch, tmp_path: Path):
@@ -63,8 +111,10 @@ def test_run_processes_pdf_via_converter(monkeypatch, tmp_path: Path):
     outputs = run(input_dir=input_dir, output_dir=output_dir)
 
     expected_output = output_dir / "the_book" / "the_book_source_raw.md"
+    expected_wiki = wiki_text_path("the_book", output_dir=output_dir)
     assert outputs == {"the_book": expected_output}
     assert expected_output.read_text(encoding="utf-8") == "# Converted\n\nBody"
+    assert expected_wiki.read_text(encoding="utf-8") == "# Converted\n\nBody"
 
 
 def test_run_processes_epub_via_markitdown(monkeypatch, tmp_path: Path):
@@ -82,8 +132,133 @@ def test_run_processes_epub_via_markitdown(monkeypatch, tmp_path: Path):
     outputs = run(input_dir=input_dir, output_dir=output_dir)
 
     expected_output = output_dir / "the_book" / "the_book_source_raw.md"
+    expected_wiki = wiki_text_path("the_book", output_dir=output_dir)
     assert outputs == {"the_book": expected_output}
     assert expected_output.read_text(encoding="utf-8") == "# EPUB Title\n\nEPUB body"
+    assert expected_wiki.read_text(encoding="utf-8") == "# EPUB Title\n\nEPUB body"
+
+
+def test_run_processes_audio_via_transcriber(monkeypatch, tmp_path: Path):
+    input_dir = tmp_path / "input"
+    expected_output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    audio_path = input_dir / "The Book.mp3"
+    audio_path.write_bytes(b"ID3")
+
+    def fake_convert(
+        path: Path,
+        output_dir: Path,
+        *,
+        book_name: str | None = None,
+        artifact_stem: str | None = None,
+    ) -> str:
+        assert path == audio_path
+        assert output_dir == expected_output_dir
+        assert book_name is None
+        assert artifact_stem is None
+        return "# Audio Title\n\nTranscript body"
+
+    monkeypatch.setattr("book_processing.pdf_converter.convert_audio_to_markdown", fake_convert)
+
+    outputs = run(input_dir=input_dir, output_dir=expected_output_dir)
+
+    expected_output = expected_output_dir / "the_book" / "the_book_source_raw.md"
+    expected_wiki = wiki_text_path("the_book", output_dir=expected_output_dir)
+    assert outputs == {"the_book": expected_output}
+    assert expected_output.read_text(encoding="utf-8") == "# Audio Title\n\nTranscript body"
+    assert expected_wiki.read_text(encoding="utf-8") == "# Audio Title\n\nTranscript body"
+
+
+def test_run_processes_audio_directory_into_single_source_raw(monkeypatch, tmp_path: Path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    source_dir = input_dir / "My Podcast"
+    source_dir.mkdir(parents=True)
+    (source_dir / "Track 10.mp3").write_bytes(b"mp3")
+    (source_dir / "Track 2.mp3").write_bytes(b"mp3")
+    (source_dir / "cover.jpg").write_bytes(b"jpg")
+    (source_dir / "notes.txt").write_text("ignored", encoding="utf-8")
+    disc_dir = source_dir / "Disc 2"
+    disc_dir.mkdir()
+    (disc_dir / "Track 1.m4b").write_bytes(b"m4b")
+
+    calls: list[tuple[Path, Path, str | None, str | None]] = []
+
+    def fake_convert(
+        path: Path,
+        output_dir: Path,
+        *,
+        book_name: str | None = None,
+        artifact_stem: str | None = None,
+    ) -> str:
+        calls.append((path, output_dir, book_name, artifact_stem))
+        return f"# {path.stem}\n\nTranscript for {path.name}"
+
+    monkeypatch.setattr("book_processing.pdf_converter.convert_audio_to_markdown", fake_convert)
+
+    outputs = run(input_dir=input_dir, output_dir=output_dir)
+
+    expected_book_name = "my_podcast"
+    expected_output = output_dir / expected_book_name / f"{expected_book_name}_{SOURCE_RAW_NAME}.md"
+    expected_wiki = wiki_text_path(expected_book_name, output_dir=output_dir)
+
+    assert outputs == {expected_book_name: expected_output}
+    assert [call[0].relative_to(source_dir).as_posix() for call in calls] == [
+        "Disc 2/Track 1.m4b",
+        "Track 2.mp3",
+        "Track 10.mp3",
+    ]
+    assert all(call[1] == output_dir for call in calls)
+    assert all(call[2] == expected_book_name for call in calls)
+    assert [call[3] for call in calls] == [
+        "my_podcast_track0001_disc_2_track_1",
+        "my_podcast_track0002_track_2",
+        "my_podcast_track0003_track_10",
+    ]
+    expected_markdown = (
+        "# Track 1\n\nTranscript for Track 1.m4b\n\n"
+        "# Track 2\n\nTranscript for Track 2.mp3\n\n"
+        "# Track 10\n\nTranscript for Track 10.mp3"
+    )
+    assert expected_output.read_text(encoding="utf-8") == expected_markdown
+    assert expected_wiki.read_text(encoding="utf-8") == expected_markdown
+
+
+def test_run_processes_audio_directory_skips_invalid_tracks(monkeypatch, tmp_path: Path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    source_dir = input_dir / "My Podcast"
+    source_dir.mkdir(parents=True)
+    (source_dir / "Track 1.mp3").write_bytes(b"mp3")
+    (source_dir / "Track 2.mp3").write_bytes(b"mp3")
+
+    def fake_convert(
+        path: Path,
+        output_dir: Path,
+        *,
+        book_name: str | None = None,
+        artifact_stem: str | None = None,
+    ) -> str:
+        if path.name == "Track 1.mp3":
+            raise InvalidAudioSourceError("empty file")
+        return f"# {path.stem}\n\nTranscript for {path.name}"
+
+    monkeypatch.setattr("book_processing.pdf_converter.convert_audio_to_markdown", fake_convert)
+
+    outputs = run(input_dir=input_dir, output_dir=output_dir)
+
+    expected_book_name = "my_podcast"
+    expected_output = output_dir / expected_book_name / f"{expected_book_name}_{SOURCE_RAW_NAME}.md"
+    expected_wiki = wiki_text_path(expected_book_name, output_dir=output_dir)
+    expected_markdown = (
+        "## Skipped audio track\n\n"
+        "Could not transcribe `Track 1.mp3` because the source audio was invalid: empty file\n\n"
+        "# Track 2\n\nTranscript for Track 2.mp3"
+    )
+
+    assert outputs == {expected_book_name: expected_output}
+    assert expected_output.read_text(encoding="utf-8") == expected_markdown
+    assert expected_wiki.read_text(encoding="utf-8") == expected_markdown
 
 
 def test_convert_epub_to_markdown_uses_markitdown(monkeypatch, tmp_path: Path):
@@ -147,6 +322,25 @@ def test_convert_pdf_to_markdown_falls_back_to_local_text(monkeypatch, tmp_path:
         lambda _path: [("The Book_page_1.png", b"page-1")],
     )
     monkeypatch.setattr("book_processing.pdf_converter.analyze_image_to_markdown", fail_image_analysis)
+    monkeypatch.setattr(
+        "book_processing.pdf_converter._extract_pdf_text_locally",
+        lambda _path: "## Page 1\n\nRecovered local text",
+    )
+
+    markdown = convert_pdf_to_markdown(pdf_path)
+
+    assert markdown == "## Page 1\n\nRecovered local text"
+
+
+def test_convert_pdf_to_markdown_falls_back_to_local_text_on_connect_error(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "The Book.pdf"
+    pdf_path.write_bytes(b"%PDF-1.7")
+    request = httpx.Request("POST", "https://example.test/analyze")
+
+    def fail_pdf_analysis(_path: Path) -> str:
+        raise httpx.ConnectError("dns failed", request=request)
+
+    monkeypatch.setattr("book_processing.pdf_converter.analyze_pdf_to_markdown", fail_pdf_analysis)
     monkeypatch.setattr(
         "book_processing.pdf_converter._extract_pdf_text_locally",
         lambda _path: "## Page 1\n\nRecovered local text",

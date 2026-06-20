@@ -8,6 +8,7 @@ from book_processing.config import (
     PODCAST_SPEAKERS,
     PROSODY_RATE,
     TTS_MAX_CHARS_PER_CHUNK,
+    VOICE_BY_LANGUAGE,
     VOICE_FEMALE,
     VOICE_MALE,
 )
@@ -22,6 +23,11 @@ def _escape_xml(text: str) -> str:
     return saxutils.escape(text)
 
 
+def _voice_for_language(lang: str, gender: str) -> str:
+    """Return the configured voice for a language and speaker gender."""
+    return VOICE_BY_LANGUAGE.get(lang, {}).get(gender, VOICE_MALE if gender == "male" else VOICE_FEMALE)
+
+
 def build_single_voice_ssml(text: str, lang: str, voice: str = VOICE_MALE) -> str:
     """Build SSML for a single voice with prosody rate adjustment.
 
@@ -34,6 +40,7 @@ def build_single_voice_ssml(text: str, lang: str, voice: str = VOICE_MALE) -> st
         Complete SSML string.
     """
     xml_lang = LANGUAGES[lang]["xml_lang"]
+    voice = _voice_for_language(lang, "male") if voice == VOICE_MALE else voice
     escaped = _escape_xml(text)
 
     return (
@@ -70,8 +77,8 @@ def parse_podcast_script(script: str, lang: str) -> list[tuple[str, str]]:
 
     # Build name→voice mapping
     name_to_voice = {
-        male_name.lower(): VOICE_MALE,
-        female_name.lower(): VOICE_FEMALE,
+        male_name.lower(): _voice_for_language(lang, "male"),
+        female_name.lower(): _voice_for_language(lang, "female"),
     }
 
     # Pattern: [SpeakerName]: followed by text until the next [SpeakerName]: or end
@@ -89,7 +96,7 @@ def parse_podcast_script(script: str, lang: str) -> list[tuple[str, str]]:
         speaker_name = parts[i].strip().lower()
         text = parts[i + 1].strip()
         if text:
-            voice = name_to_voice.get(speaker_name, VOICE_MALE)
+            voice = name_to_voice.get(speaker_name, _voice_for_language(lang, "male"))
             segments.append((voice, text))
         i += 2
 

@@ -48,7 +48,11 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     t0 = time.time()
     from book_processing.pdf_converter import run as run_pdf
 
-    book_sources = run_pdf(input_dir, output_dir)
+    try:
+        book_sources = run_pdf(input_dir, output_dir)
+    except FileNotFoundError:
+        logger.warning("No supported input files found in %s; using existing output source_raw files if present", input_dir)
+        book_sources = {}
     logger.info("Stage 1 complete in %.0fs: %d books", time.time() - t0, len(book_sources))
 
     # --- Stage 2+3: Overlapped LLM + TTS ---
@@ -72,22 +76,48 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
         logger.info("Starting per-book LLM pipeline: %s", book_name)
         return run_llm(book_name, source_md_path, output_dir, on_file_ready=on_file_ready)
 
-    # Run LLM for all books in parallel; each completed file triggers on_file_ready -> TTS
     text_outputs: dict[str, Path] = {}
-    max_workers = min(BOOK_MAX_WORKERS, len(book_sources))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(_run_book, book_name, source_md_path): book_name
-            for book_name, source_md_path in book_sources.items()
-        }
-        for future in as_completed(futures):
-            book_name = futures[future]
-            book_outputs = future.result()
-            text_outputs.update(book_outputs)
-            logger.info("LLM finished for %s: %d text files", book_name, len(book_outputs))
+    if book_sources:
+        # Run LLM for all books in parallel; each completed file triggers on_file_ready -> TTS
+        max_workers = min(BOOK_MAX_WORKERS, len(book_sources))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_run_book, book_name, source_md_path): book_name
+                for book_name, source_md_path in book_sources.items()
+            }
+            for future in as_completed(futures):
+                book_name = futures[future]
+                book_outputs = future.result()
+                text_outputs.update(book_outputs)
+                logger.info("LLM finished for %s: %d text files", book_name, len(book_outputs))
+    else:
+        logger.info("No current input books for summary/podcast/TTS generation")
 
     llm_elapsed = time.time() - t0
     logger.info("LLM complete in %.0fs: %d text files across %d books", llm_elapsed, len(text_outputs), len(book_sources))
+
+    # --- HTML visualizations: current inputs plus already processed output folders ---
+    logger.info("STAGE 4: English HTML visualizations")
+    t0_visual = time.time()
+    from book_processing.html_visualizer import discover_existing_source_raws, run as run_html_visualizer
+
+    visual_sources = discover_existing_source_raws(output_dir)
+    visual_sources.update(book_sources)
+    html_outputs: dict[str, Path] = {}
+    if visual_sources:
+        max_visual_workers = min(BOOK_MAX_WORKERS, len(visual_sources))
+        with ThreadPoolExecutor(max_workers=max_visual_workers) as pool:
+            futures = {
+                pool.submit(run_html_visualizer, book_name, source_md_path, output_dir): book_name
+                for book_name, source_md_path in visual_sources.items()
+            }
+            for future in as_completed(futures):
+                book_name = futures[future]
+                html_outputs[book_name] = future.result()
+                logger.info("HTML visualization finished for %s", book_name)
+    else:
+        logger.info("No source_raw files found for HTML visualization")
+    logger.info("HTML visualization complete in %.0fs: %d files", time.time() - t0_visual, len(html_outputs))
 
     # Queue any text files that already existed (skipped by LLM) but have no audio
     for book_name in book_sources:
@@ -119,11 +149,25 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
         size_mb = path.stat().st_size / 1024 / 1024
         logger.info("  %s: %.1f MB", name, size_mb)
 
+    # --- Static web catalog ---
+    logger.info("STAGE 5: Static web catalog")
+    t0_site = time.time()
+    from book_processing.site_generator import generate_site
+
+    book_pages = generate_site(output_dir)
+    logger.info("Static web catalog complete in %.0fs: %d book pages", time.time() - t0_site, len(book_pages))
+
     # --- Done ---
     total = time.time() - pipeline_start
     logger.info("=" * 60)
     logger.info("Pipeline complete in %.0fs (%.1f min)!", total, total / 60)
-    logger.info("Text files: %d | Audio files: %d", len(text_outputs), len(audio_outputs))
+    logger.info(
+        "Text files: %d | Audio files: %d | HTML files: %d | Site pages: %d",
+        len(text_outputs),
+        len(audio_outputs),
+        len(html_outputs),
+        len(book_pages) + 1,
+    )
     logger.info("=" * 60)
 
 

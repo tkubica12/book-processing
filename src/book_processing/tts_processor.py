@@ -18,7 +18,7 @@ from queue import Empty, Queue
 import httpx
 from mutagen.id3 import COMM, ID3, TALB, TCON, TIT2, TLAN, TPE1
 
-from book_processing.auth import get_cognitive_token
+from book_processing.auth import get_cognitive_token, invalidate_cognitive_token
 from book_processing.config import (
     AUDIO_OUTPUT_FORMAT,
     AZURE_SPEECH_ENDPOINT,
@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 10
 CONTENT_TITLE_LABELS = {
-    "summary_2min": "Summary 2 min",
     "summary_5min": "Summary 5 min",
     "summary_20min": "Summary 20 min",
+    "podcast_20min": "Podcast 20 min",
     "podcast_60min": "Podcast 60 min",
     SOURCE_TTS_NAME: "Source TTS",
 }
@@ -132,12 +132,21 @@ def _submit_batch_synthesis(
     }
 
     logger.info("Submitting TTS job '%s' (id=%s, %d input(s))...", display_name, job_id, len(ssml_inputs))
+    current_headers = dict(headers)
     for attempt in range(5):
         try:
-            response = client.put(url, json=body, headers=headers)
+            response = client.put(url, json=body, headers=current_headers)
             response.raise_for_status()
             logger.info("Job submitted: %s", job_id)
             return job_id
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401 and attempt < 4:
+                logger.warning("Token expired during submit for %s; refreshing and retrying", display_name)
+                invalidate_cognitive_token()
+                current_headers = _auth_headers(_get_token())
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             logger.warning("Submit failed (attempt %d): %s. Retrying...", attempt + 1, e)
             time.sleep(10 * (attempt + 1))
@@ -161,6 +170,12 @@ def _check_job_status(client: httpx.Client, headers: dict[str, str], job_id: str
             error = data.get("properties", {}).get("error", "Unknown error")
             raise RuntimeError(f"Batch synthesis job {job_id} failed: {error}")
         return None
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            logger.warning("Token expired during poll for %s; will refresh", job_id)
+        else:
+            logger.warning("HTTP error polling %s: %s", job_id, e)
+        return None
     except (
         httpx.ConnectError,
         httpx.TimeoutException,
@@ -178,9 +193,14 @@ def _download_audio_bytes(client: httpx.Client, job_data: dict) -> bytes:
     if not result_url:
         raise ValueError(f"No result URL in job data: {job_data}")
 
-    for attempt in range(3):
+    last_exc: Exception | None = None
+    for attempt in range(5):
         try:
-            response = client.get(result_url, follow_redirects=True, timeout=600)
+            response = client.get(
+                result_url,
+                follow_redirects=True,
+                timeout=httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0),
+            )
             response.raise_for_status()
             break
         except (
@@ -188,11 +208,16 @@ def _download_audio_bytes(client: httpx.Client, job_data: dict) -> bytes:
             httpx.TimeoutException,
             httpx.RemoteProtocolError,
             httpx.ReadError,
+            OSError,
         ) as e:
+            last_exc = e
             logger.warning("Download failed (attempt %d): %s", attempt + 1, e)
-            if attempt == 2:
+            if attempt == 4:
                 raise
             time.sleep(15)
+    else:
+        if last_exc is not None:
+            raise last_exc
 
     zip_data = io.BytesIO(response.content)
     with zipfile.ZipFile(zip_data) as zf:
@@ -233,7 +258,7 @@ class TtsJobTracker:
 
         tracker = TtsJobTracker()
         Thread(target=tracker.poll_loop).start()
-        tracker.enqueue("book_name", "summary_2min", "en", path, is_podcast=False)
+        tracker.enqueue("book_name", "summary_5min", "en", path, is_podcast=False)
         tracker.finalize()
         tracker.wait()
         outputs = tracker.get_outputs()
@@ -338,7 +363,7 @@ class TtsJobTracker:
 
     def poll_loop(self) -> None:
         """Main processing loop: dequeue, submit, poll, download."""
-        client = httpx.Client(timeout=300)
+        client = httpx.Client(timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=30.0))
         try:
             while True:
                 # Drain pending queue, submit up to concurrency limit
@@ -376,7 +401,12 @@ class TtsJobTracker:
                                 raise timeout_error
                             continue
 
-                        self._handle_completed_job(client, headers, job, data)
+                        try:
+                            self._handle_completed_job(client, headers, job, data)
+                        except (ValueError, RuntimeError, httpx.HTTPError, OSError) as exc:
+                            if self._retry_failed_job(client, headers, job, exc):
+                                continue
+                            raise
                         completed.append(job)
                     for job in completed:
                         self._active.remove(job)
@@ -422,7 +452,10 @@ class TtsJobTracker:
             logger.info("TTS chunk done: %s chunk %d (%.1f MB)",
                         parent, chunk_idx + 1, len(audio_bytes) / 1024 / 1024)
             with self._assembly_lock:
-                entry = self._assembly[parent]
+                entry = self._assembly.get(parent)
+                if entry is None:
+                    logger.debug("Ignoring late TTS chunk for already assembled parent %s", parent)
+                    return
                 entry["parts"][chunk_idx] = audio_bytes
                 done_count = len(entry["parts"])
                 total = entry["total"]
@@ -476,9 +509,11 @@ class TtsJobTracker:
         )
         _delete_job(client, headers, job["job_id"])
         time.sleep(5 * (retries + 1))
+        invalidate_cognitive_token()
+        refreshed_headers = _auth_headers(_get_token())
         job["job_id"] = _submit_batch_synthesis(
             client,
-            headers,
+            refreshed_headers,
             job["ssml_inputs"],
             display,
         )

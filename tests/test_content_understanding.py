@@ -13,7 +13,7 @@ def test_normalize_endpoint_removes_trailing_slash():
 def test_summary_prompt_still_mentions_shorter_output_for_short_sources():
     prompt = render_prompt(
         "simple_summary_user.j2",
-        description="technical deep-dive with implementation details",
+        description="in-depth condensed version of the book",
         target_words=3200,
         source_md="Short source",
     )

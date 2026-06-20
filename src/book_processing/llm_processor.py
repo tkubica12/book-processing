@@ -325,20 +325,22 @@ def _do_simple_summary(client: AzureOpenAI, source_md: str, summary_type: str, l
 def _do_podcast_section(
     client: AzureOpenAI, section_text: str,
     section_idx: int, total_sections: int, lang: str, book_name: str, output_dir: Path,
+    podcast_type: str,
 ) -> str:
     """Generate a single podcast section with crash recovery via partial files."""
     speakers = PODCAST_SPEAKERS[lang]
     lang_label = LANGUAGES[lang]["label"]
-    target_words = SUMMARY_TYPES["podcast_60min"]["target_words"]
-    words_per_section = target_words // total_sections
+    target_words = SUMMARY_TYPES[podcast_type]["target_words"]
+    words_per_section = max(1, target_words // total_sections)
     section_num = section_idx + 1
 
     partial_dir = book_output_dir(book_name, output_dir) / "_partial"
     partial_dir.mkdir(parents=True, exist_ok=True)
-    partial_path = partial_dir / f"{book_name}_podcast_60min_{lang}_section{section_num}.md"
+    partial_path = partial_dir / f"{book_name}_{podcast_type}_{lang}_section{section_num}.md"
 
     if partial_path.exists() and partial_path.stat().st_size > 100:
-        logger.info("Loading cached podcast section %d/%d for %s", section_num, total_sections, lang)
+        logger.info("Loading cached %s section %d/%d for %s",
+                    podcast_type, section_num, total_sections, lang)
         return partial_path.read_text(encoding="utf-8")
 
     system_prompt = render_prompt(
@@ -348,25 +350,36 @@ def _do_podcast_section(
         female_speaker=speakers["female"],
     )
 
-    if section_num == 1:
+    if total_sections == 1:
+        section_role = "opening"
+    elif section_num == 1:
         section_role = "opening"
     elif section_num == total_sections:
         section_role = "closing"
     else:
         section_role = "middle"
 
-    user_prompt = render_prompt(
-        "podcast_section_user.j2",
-        section_num=section_num,
-        total_sections=total_sections,
-        section_role=section_role,
-        words_per_section=words_per_section,
-        max_words=int(words_per_section * 1.2),
-        section_text=section_text,
+    logger.info("Generating %s section %d/%d in %s (~%d words)...",
+                podcast_type, section_num, total_sections, lang_label, words_per_section)
+    cache_prefix = f"{book_name}_{podcast_type}_{lang}_section{section_num}"
+    result = _recover_filtered_text(
+        client=client,
+        system_prompt=system_prompt,
+        render_user_prompt=lambda text: render_prompt(
+            "podcast_section_user.j2",
+            section_num=section_num,
+            total_sections=total_sections,
+            section_role=section_role,
+            words_per_section=words_per_section,
+            max_words=int(words_per_section * 1.2),
+            section_text=text,
+        ),
+        source_text=section_text,
+        lang=lang,
+        partial_dir=partial_dir,
+        cache_prefix=cache_prefix,
+        max_tokens=8000,
     )
-    logger.info("Generating podcast section %d/%d in %s (~%d words)...",
-                section_num, total_sections, lang_label, words_per_section)
-    result = _call_llm(client, system_prompt, user_prompt, max_tokens=8000)
     if result:
         partial_path.write_text(result, encoding="utf-8")
     return result
@@ -444,11 +457,18 @@ def run(
     client = _get_client()
     outputs: dict[str, Path] = {}
 
-    # Prepare podcast sections
+    # Prepare podcast sections (size depends on podcast type — keep ~1600 words/section)
     source_trimmed = source_md[:120000]
-    section_size = 20000
-    podcast_sections = [source_trimmed[i:i + section_size]
-                        for i in range(0, len(source_trimmed), section_size)]
+    WORDS_PER_PODCAST_SECTION = 1600
+
+    def _podcast_sections_for(podcast_type: str) -> list[str]:
+        target_words = SUMMARY_TYPES[podcast_type]["target_words"]
+        n = max(1, target_words // WORDS_PER_PODCAST_SECTION)
+        if n == 1:
+            return [source_trimmed]
+        chunk = max(1, len(source_trimmed) // n)
+        return [source_trimmed[i * chunk:(i + 1) * chunk] for i in range(n - 1)] + \
+               [source_trimmed[(n - 1) * chunk:]]
 
     # Prepare TTS chunks
     chunk_size = 20000
@@ -457,8 +477,8 @@ def run(
 
     # Build ALL atomic tasks
     all_tasks: list[dict] = []
-    podcast_needed: dict[str, int] = {}   # lang -> total sections needed
-    tts_needed: dict[str, int] = {}       # lang -> total chunks needed
+    podcast_needed: dict[tuple[str, str], int] = {}  # (podcast_type, lang) -> total sections
+    tts_needed: dict[str, int] = {}                  # lang -> total chunks needed
 
     for stype, spec in SUMMARY_TYPES.items():
         if spec["is_podcast"]:
@@ -478,23 +498,28 @@ def run(
                 "key": key,
             })
 
-    for lang in LANGUAGES:
-        path = output_text_path(book_name, "podcast_60min", lang, output_dir=output_dir)
-        key = f"{book_name}_podcast_60min_{lang}"
-        if path.exists() and path.stat().st_size > 100:
-            logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
-            outputs[key] = path
+    for stype, spec in SUMMARY_TYPES.items():
+        if not spec["is_podcast"]:
             continue
-        podcast_needed[lang] = len(podcast_sections)
-        for idx in range(len(podcast_sections)):
-            all_tasks.append({
-                "type": "podcast_section",
-                "section_idx": idx,
-                "total_sections": len(podcast_sections),
-                "section_text": podcast_sections[idx],
-                "lang": lang,
-                "key": f"podcast_{lang}_s{idx + 1}",
-            })
+        sections = _podcast_sections_for(stype)
+        for lang in LANGUAGES:
+            path = output_text_path(book_name, stype, lang, output_dir=output_dir)
+            key = f"{book_name}_{stype}_{lang}"
+            if path.exists() and path.stat().st_size > 100:
+                logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
+                outputs[key] = path
+                continue
+            podcast_needed[(stype, lang)] = len(sections)
+            for idx in range(len(sections)):
+                all_tasks.append({
+                    "type": "podcast_section",
+                    "podcast_type": stype,
+                    "section_idx": idx,
+                    "total_sections": len(sections),
+                    "section_text": sections[idx],
+                    "lang": lang,
+                    "key": f"{stype}_{lang}_s{idx + 1}",
+                })
 
     for lang in LANGUAGES:
         path = output_text_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
@@ -522,7 +547,7 @@ def run(
 
     # Thread-safe assembly tracking
     lock = threading.Lock()
-    podcast_parts: dict[str, dict[int, str]] = {lang: {} for lang in podcast_needed}
+    podcast_parts: dict[tuple[str, str], dict[int, str]] = {key: {} for key in podcast_needed}
     tts_parts: dict[str, dict[int, str]] = {lang: {} for lang in tts_needed}
 
     def _handle_result(task: dict, text: str) -> None:
@@ -541,24 +566,26 @@ def run(
 
         elif ttype == "podcast_section":
             lang = task["lang"]
+            podcast_type = task["podcast_type"]
             total = task["total_sections"]
+            assembly_key = (podcast_type, lang)
             with lock:
-                podcast_parts[lang][task["section_idx"]] = text
-                done_count = len(podcast_parts[lang])
+                podcast_parts[assembly_key][task["section_idx"]] = text
+                done_count = len(podcast_parts[assembly_key])
             logger.info("-> %s (%d words) [%d/%d sections]",
                         task["key"], len(text.split()), done_count, total)
             if done_count == total:
-                assembled = "\n\n".join(podcast_parts[lang][i] for i in range(total))
-                path = output_text_path(book_name, "podcast_60min", lang, output_dir=output_dir)
+                assembled = "\n\n".join(podcast_parts[assembly_key][i] for i in range(total))
+                path = output_text_path(book_name, podcast_type, lang, output_dir=output_dir)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(assembled, encoding="utf-8")
-                key = f"{book_name}_podcast_60min_{lang}"
+                key = f"{book_name}_{podcast_type}_{lang}"
                 with lock:
                     outputs[key] = path
                 logger.info("=> Assembled %s (%d words from %d sections)",
                             key, len(assembled.split()), total)
                 if on_file_ready:
-                    on_file_ready(book_name, "podcast_60min", lang, path, True)
+                    on_file_ready(book_name, podcast_type, lang, path, True)
 
         elif ttype == "tts_chunk":
             lang = task["lang"]
@@ -594,6 +621,7 @@ def run(
                 future = pool.submit(
                     _do_podcast_section, client, task["section_text"],
                     task["section_idx"], task["total_sections"], task["lang"], book_name, output_dir,
+                    task["podcast_type"],
                 )
             elif task["type"] == "tts_chunk":
                 future = pool.submit(

@@ -15,6 +15,10 @@ def test_prompt_templates_are_discoverable():
         "simple_summary_user.j2",
         "tts_chunk_system.j2",
         "tts_chunk_user.j2",
+        "visual_chunk_system.j2",
+        "visual_chunk_user.j2",
+        "visual_outline_system.j2",
+        "visual_outline_user.j2",
     ]
 
 
@@ -26,7 +30,7 @@ def test_simple_summary_prompt_renders_variables():
     )
     user_prompt = render_prompt(
         "simple_summary_user.j2",
-        description="high-level architectural summary",
+        description="short summary capturing the core ideas of the book",
         target_words=320,
         source_md="Source text",
     )
@@ -34,7 +38,7 @@ def test_simple_summary_prompt_renders_variables():
     assert "English" in system_prompt
     assert "320" in system_prompt
     assert "ceiling, not a quota" in system_prompt
-    assert "high-level architectural summary" in user_prompt
+    assert "short summary capturing the core ideas of the book" in user_prompt
     assert "Source text" in user_prompt
     assert "produce a shorter answer rather than padding it" in user_prompt
 
@@ -83,3 +87,18 @@ def test_tts_prompt_includes_optional_translation_instruction():
 def test_render_prompt_requires_expected_variables():
     with pytest.raises(Exception):
         render_prompt("simple_summary_system.j2")
+
+
+def test_visual_outline_prompt_requires_english_json():
+    system_prompt = render_prompt("visual_outline_system.j2")
+    user_prompt = render_prompt(
+        "visual_outline_user.j2",
+        book_name="sample_book",
+        source_md="Source text",
+    )
+
+    assert "strict JSON only" in system_prompt
+    assert "Use English only" in system_prompt
+    assert "3-20 top-level segments" in system_prompt
+    assert "sample_book" in user_prompt
+    assert "Source text" in user_prompt

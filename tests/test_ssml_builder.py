@@ -12,7 +12,7 @@ from book_processing.ssml_builder import (
 def test_build_single_voice_ssml_english():
     ssml = build_single_voice_ssml("Hello world", "en")
     assert 'xml:lang="en-US"' in ssml
-    assert 'name="en-US-Andrew:DragonHDLatestNeural"' in ssml
+    assert 'name="en-US-Ethan:MAI-Voice-2"' in ssml
     assert 'rate="+20%"' in ssml
     assert "Hello world" in ssml
     assert ssml.startswith("<speak")
@@ -36,9 +36,9 @@ def test_parse_podcast_script_english():
     script = "[Andrew]: Hello everyone!\n[Emma]: Welcome to the show!\n[Andrew]: Let's dive in."
     segments = parse_podcast_script(script, "en")
     assert len(segments) == 3
-    assert segments[0][0] == "en-US-Andrew:DragonHDLatestNeural"
+    assert segments[0][0] == "en-US-Ethan:MAI-Voice-2"
     assert "Hello everyone!" in segments[0][1]
-    assert segments[1][0] == "en-US-Emma:DragonHDLatestNeural"
+    assert segments[1][0] == "en-US-Harper:MAI-Voice-2"
     assert "Welcome to the show!" in segments[1][1]
 
 

@@ -59,3 +59,11 @@ def get_cognitive_token() -> str:
         _token_expires_on = expires_on
     logger.debug("Azure CLI token refreshed (expires in %.0f min)", (_token_expires_on - time.time()) / 60)
     return token
+
+
+def invalidate_cognitive_token() -> None:
+    """Drop the cached Cognitive Services token so the next call fetches a fresh one."""
+    global _cached_token, _token_expires_on
+    with _token_lock:
+        _cached_token = None
+        _token_expires_on = 0.0
