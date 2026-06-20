@@ -17,7 +17,6 @@ from book_processing.config import (
     LANGUAGES,
     OUTPUT_DIR,
     SOURCE_TTS_NAME,
-    SUMMARY_TYPES,
     output_audio_path,
     output_text_path,
 )
@@ -59,7 +58,9 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
     logger.info("STAGE 2+3: LLM + TTS (overlapped)")
     t0 = time.time()
 
-    from book_processing.llm_processor import run as run_llm
+    from book_processing.config import book_output_dir
+    from book_processing.llm_processor import run as run_llm, summary_types_for_source
+    from book_processing.metadata import DOCUMENT_PAPER, infer_document_type, read_metadata
     from book_processing.tts_processor import TtsJobTracker
 
     # Create TTS tracker and start its polling loop in a background thread
@@ -121,13 +122,19 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
 
     # Queue any text files that already existed (skipped by LLM) but have no audio
     for book_name in book_sources:
-        for stype, spec in SUMMARY_TYPES.items():
+        source_md = book_sources[book_name].read_text(encoding="utf-8")
+        metadata = read_metadata(book_output_dir(book_name, output_dir))
+        document_type = metadata.document_type if metadata else infer_document_type(book_name, source_md)
+        summary_types = summary_types_for_source(book_name, source_md, document_type)
+        for stype, spec in summary_types.items():
             for lang in LANGUAGES:
                 tp = output_text_path(book_name, stype, lang, output_dir=output_dir)
                 ap = output_audio_path(book_name, stype, lang, output_dir=output_dir)
                 if tp.exists() and not (ap.exists() and ap.stat().st_size > 1000):
                     logger.info("Queuing existing text for TTS: %s_%s_%s", book_name, stype, lang)
                     tracker.enqueue(book_name, stype, lang, tp, spec["is_podcast"])
+        if document_type == DOCUMENT_PAPER:
+            continue
         for lang in LANGUAGES:
             tp = output_text_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
             ap = output_audio_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)

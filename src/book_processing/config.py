@@ -119,7 +119,9 @@ TTS_JOB_MAX_RETRIES = 5  # Retries per submitted batch job before failing
 TTS_JOB_STALE_AFTER_SECONDS = int(
     os.getenv("TTS_JOB_STALE_AFTER_SECONDS", "3600")
 )  # Retry batch jobs that stay running for too long (1 hour default)
-TTS_MAX_CHARS_PER_CHUNK = 25_000  # Smaller chunks are more reliable for long-form TTS
+TTS_MAX_CHARS_PER_CHUNK = int(
+    os.getenv("TTS_MAX_CHARS_PER_CHUNK", "25000")
+)  # Smaller chunks are more reliable for long-form TTS
 AUDIO_STT_CHUNK_DURATION_MINUTES = int(
     os.getenv("AUDIO_STT_CHUNK_DURATION_MINUTES", "30")
 )

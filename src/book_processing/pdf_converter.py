@@ -19,11 +19,23 @@ from book_processing.config import (
     INPUT_DIR,
     OUTPUT_DIR,
     SOURCE_RAW_NAME,
+    book_output_dir,
     book_name_from_source,
     book_name_from_pdf,
     output_text_path,
     sanitize_book_name,
     wiki_text_path,
+)
+from book_processing.metadata import (
+    DOCUMENT_BOOK,
+    DOCUMENT_PAPER,
+    SOURCE_MEDIUM_AUDIO,
+    SOURCE_MEDIUM_EPUB,
+    SOURCE_MEDIUM_PDF,
+    SOURCE_MEDIUM_TEXT,
+    SourceMetadata,
+    classify_labels,
+    write_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,6 +43,7 @@ logger = logging.getLogger(__name__)
 SUPPORTED_AUDIO_SUFFIXES = (".m4b", ".mp3")
 SUPPORTED_TEXT_SUFFIXES = (".md", ".txt")
 SUPPORTED_SOURCE_SUFFIXES = (".epub", ".pdf", *SUPPORTED_TEXT_SUFFIXES, *SUPPORTED_AUDIO_SUFFIXES)
+ARXIV_INPUT_DIR_NAME = "arxiv"
 _NATURAL_SORT_PATTERN = re.compile(r"\d+|\D+")
 _SKIPPED_AUDIO_TRACK_TEMPLATE = (
     "## Skipped audio track\n\n"
@@ -63,19 +76,25 @@ def _find_audio_files_in_directory(source_dir: Path) -> list[Path]:
 
 def find_source_files(input_dir: Path = INPUT_DIR) -> list[Path]:
     """Find supported top-level sources, including audio folders, in deterministic order."""
-    sources = sorted(
-        (
+    arxiv_dir = input_dir / ARXIV_INPUT_DIR_NAME
+    arxiv_sources = []
+    if arxiv_dir.exists():
+        arxiv_sources = [
             path
-            for path in input_dir.iterdir()
-            if (
-                path.is_file() and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES
-            )
-            or (
-                path.is_dir() and bool(_find_audio_files_in_directory(path))
-            )
-        ),
-        key=lambda path: _natural_sort_key(path.name),
-    )
+            for path in arxiv_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".pdf"
+        ]
+
+    book_sources = [
+        path
+        for path in input_dir.iterdir()
+        if path.name != ARXIV_INPUT_DIR_NAME
+        and (
+            (path.is_file() and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES)
+            or (path.is_dir() and bool(_find_audio_files_in_directory(path)))
+        )
+    ]
+    sources = sorted(book_sources + arxiv_sources, key=lambda path: _natural_sort_key(str(path.relative_to(input_dir))))
     logger.info("Found %d source item(s) in %s", len(sources), input_dir)
     return sources
 
@@ -228,6 +247,58 @@ def _write_stage1_markdown(book_name: str, markdown: str, output_dir: Path) -> P
     return output_path
 
 
+def _source_path_for_metadata(source_path: Path, input_dir: Path) -> str:
+    """Return source path relative to the input directory for metadata."""
+
+    try:
+        return str(source_path.relative_to(input_dir))
+    except ValueError:
+        return source_path.name
+
+
+def _document_type_for_source(source_path: Path, input_dir: Path) -> str:
+    """Return explicit document type from source layout."""
+
+    try:
+        relative = source_path.relative_to(input_dir)
+    except ValueError:
+        return DOCUMENT_BOOK
+    return DOCUMENT_PAPER if len(relative.parts) > 1 and relative.parts[0] == ARXIV_INPUT_DIR_NAME else DOCUMENT_BOOK
+
+
+def _source_medium_for_source(source_path: Path) -> str:
+    """Return source medium metadata for a source path."""
+
+    if source_path.is_dir() or source_path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES:
+        return SOURCE_MEDIUM_AUDIO
+    suffix = source_path.suffix.lower()
+    if suffix == ".pdf":
+        return SOURCE_MEDIUM_PDF
+    if suffix == ".epub":
+        return SOURCE_MEDIUM_EPUB
+    if suffix in SUPPORTED_TEXT_SUFFIXES:
+        return SOURCE_MEDIUM_TEXT
+    return "unknown"
+
+
+def _write_source_metadata(
+    book_name: str,
+    source_path: Path,
+    input_dir: Path,
+    output_dir: Path,
+    source_md: str,
+) -> Path:
+    """Write metadata.yaml for a processed source."""
+
+    metadata = SourceMetadata(
+        source_path=_source_path_for_metadata(source_path, input_dir),
+        document_type=_document_type_for_source(source_path, input_dir),
+        source_medium=_source_medium_for_source(source_path),
+        labels=classify_labels(book_name, source_text=source_md[:250_000]),
+    )
+    return write_metadata(book_output_dir(book_name, output_dir), metadata)
+
+
 def _process_pdf(pdf_path: Path, output_dir: Path) -> tuple[str, Path]:
     """Convert, clean, and save one PDF as its own raw markdown file."""
     book_name = book_name_from_pdf(pdf_path)
@@ -316,11 +387,18 @@ def _process_audio_directory(source_dir: Path, output_dir: Path) -> tuple[str, P
     return book_name, output_path
 
 
-def _process_source(source_path: Path, output_dir: Path) -> tuple[str, Path]:
+def _process_source(source_path: Path, input_dir: Path, output_dir: Path) -> tuple[str, Path]:
     """Normalize one supported source path into the raw-markdown output location."""
     book_name = book_name_from_source(source_path)
     existing_raw = _raw_output_path(book_name, output_dir)
     if existing_raw.exists() and existing_raw.stat().st_size > 0:
+        _write_source_metadata(
+            book_name,
+            source_path,
+            input_dir,
+            output_dir,
+            existing_raw.read_text(encoding="utf-8", errors="ignore"),
+        )
         wiki_path = wiki_text_path(book_name, output_dir=output_dir)
         if not wiki_path.exists():
             wiki_path.parent.mkdir(parents=True, exist_ok=True)
@@ -331,17 +409,27 @@ def _process_source(source_path: Path, output_dir: Path) -> tuple[str, Path]:
         return book_name, existing_raw
 
     if source_path.is_dir():
-        return _process_audio_directory(source_path, output_dir)
+        book_name, output_path = _process_audio_directory(source_path, output_dir)
     suffix = source_path.suffix.lower()
-    if suffix == ".epub":
-        return _process_epub(source_path, output_dir)
-    if suffix == ".pdf":
-        return _process_pdf(source_path, output_dir)
-    if suffix in SUPPORTED_TEXT_SUFFIXES:
-        return _process_text_source(source_path, output_dir)
-    if suffix in SUPPORTED_AUDIO_SUFFIXES:
-        return _process_audio(source_path, output_dir)
-    raise ValueError(f"Unsupported source file type: {source_path}")
+    if not source_path.is_dir():
+        if suffix == ".epub":
+            book_name, output_path = _process_epub(source_path, output_dir)
+        elif suffix == ".pdf":
+            book_name, output_path = _process_pdf(source_path, output_dir)
+        elif suffix in SUPPORTED_TEXT_SUFFIXES:
+            book_name, output_path = _process_text_source(source_path, output_dir)
+        elif suffix in SUPPORTED_AUDIO_SUFFIXES:
+            book_name, output_path = _process_audio(source_path, output_dir)
+        else:
+            raise ValueError(f"Unsupported source file type: {source_path}")
+    _write_source_metadata(
+        book_name,
+        source_path,
+        input_dir,
+        output_dir,
+        output_path.read_text(encoding="utf-8", errors="ignore"),
+    )
+    return book_name, output_path
 
 
 def run(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> dict[str, Path]:
@@ -357,7 +445,7 @@ def run(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> dict[str,
     logger.info("Processing %d source item(s) as independent books with %d workers", len(source_files), max_workers)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(_process_source, source_path, output_dir): source_path
+            pool.submit(_process_source, source_path, input_dir, output_dir): source_path
             for source_path in source_files
         }
         for future in as_completed(futures):

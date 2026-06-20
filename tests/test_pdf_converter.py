@@ -8,6 +8,7 @@ import pytest
 from book_processing.content_understanding import ContentUnderstandingNoUsableMarkdownError
 from book_processing.config import SOURCE_RAW_NAME, wiki_text_path
 from book_processing.audio_transcriber import InvalidAudioSourceError
+from book_processing.metadata import read_metadata
 from book_processing.pdf_converter import (
     convert_epub_to_markdown,
     convert_pdf_to_markdown,
@@ -36,6 +37,20 @@ def test_find_source_files_returns_supported_sources(tmp_path: Path):
         "book_c.mp3",
         "book_d.m4b",
     ]
+
+
+def test_find_source_files_treats_arxiv_pdfs_as_papers_and_ignores_arxiv_folders(tmp_path: Path):
+    arxiv_dir = tmp_path / "arxiv"
+    arxiv_dir.mkdir()
+    (arxiv_dir / "Paper 2.pdf").write_bytes(b"%PDF-1.7")
+    nested = arxiv_dir / "Ignored Folder"
+    nested.mkdir()
+    (nested / "Paper 1.pdf").write_bytes(b"%PDF-1.7")
+    (tmp_path / "Book.pdf").write_bytes(b"%PDF-1.7")
+
+    sources = find_source_files(tmp_path)
+
+    assert [path.relative_to(tmp_path).as_posix() for path in sources] == ["arxiv/Paper 2.pdf", "Book.pdf"]
 
 
 def test_find_source_files_includes_audio_directories_with_supported_audio_only(tmp_path: Path):
@@ -77,6 +92,36 @@ def test_run_copies_markdown_inputs_to_source_raw(tmp_path: Path):
     assert outputs == {expected_book_name: expected_output}
     assert expected_output.read_text(encoding="utf-8") == "# Heading\n\nBody text."
     assert expected_wiki.read_text(encoding="utf-8") == "# Heading\n\nBody text."
+    metadata = read_metadata(output_dir / expected_book_name)
+    assert metadata is not None
+    assert metadata.source_path == "The Book.md"
+    assert metadata.document_type == "book"
+    assert metadata.source_medium == "text"
+    assert metadata.labels
+
+
+def test_run_writes_paper_metadata_for_arxiv_pdf(monkeypatch, tmp_path: Path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    arxiv_dir = input_dir / "arxiv"
+    arxiv_dir.mkdir(parents=True)
+    pdf_path = arxiv_dir / "HyDRA.pdf"
+    pdf_path.write_bytes(b"%PDF-1.7")
+
+    monkeypatch.setattr(
+        "book_processing.pdf_converter.convert_pdf_to_markdown",
+        lambda path: "# HyDRA\n\nAbstract\n\nAI routing paper.\n\nReferences\n\nOng et al.",
+    )
+
+    outputs = run(input_dir=input_dir, output_dir=output_dir)
+
+    assert set(outputs) == {"hydra"}
+    metadata = read_metadata(output_dir / "hydra")
+    assert metadata is not None
+    assert metadata.source_path == "arxiv\\HyDRA.pdf"
+    assert metadata.document_type == "paper"
+    assert metadata.source_medium == "PDF"
+    assert "AI" in metadata.labels
 
 
 def test_run_copies_text_inputs_to_source_raw_and_wiki(tmp_path: Path):

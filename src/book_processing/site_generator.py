@@ -10,6 +10,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 from book_processing.config import LANGUAGES, OUTPUT_DIR, VISUAL_SUMMARY_NAME
+from book_processing.metadata import (
+    DOCUMENT_BOOK,
+    DOCUMENT_PAPER,
+    SourceMetadata,
+    classify_labels,
+    display_document_label,
+    infer_document_type,
+    read_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,68 +30,6 @@ _AUDIO_TYPES = {
     "source_tts": ("Full audiobook", 5),
 }
 _INDEX_NAME = "index.html"
-_LABEL_RULES = {
-    "AI": (
-        "ai",
-        "artificial intelligence",
-        "agent",
-        "agents",
-        "copilot",
-        "foundation model",
-        "llm",
-        "machine learning",
-        "openai",
-    ),
-    "Biology": (
-        "biology",
-        "brain",
-        "consciousness",
-        "evolution",
-        "gene",
-        "genetic",
-        "human",
-        "life",
-        "mitochondria",
-        "neural",
-        "neuroscience",
-    ),
-    "Technology": (
-        "architecture",
-        "computation",
-        "computer",
-        "data",
-        "engineering",
-        "internet",
-        "robot",
-        "software",
-        "technology",
-    ),
-    "Society": (
-        "capitalism",
-        "culture",
-        "doubt",
-        "food",
-        "social",
-        "society",
-        "work",
-    ),
-    "Physics": (
-        "astrobiology",
-        "chemistry",
-        "entropy",
-        "field",
-        "physics",
-        "quantum",
-        "universe",
-    ),
-    "Health": (
-        "anxious",
-        "dose",
-        "health",
-        "pain",
-        "suicide",
-    ),
-}
 
 
 @dataclass(frozen=True)
@@ -109,6 +56,7 @@ class BookPage:
     page_path: Path
     visual_summary_path: Path | None
     audio_assets: tuple[AudioAsset, ...]
+    document_type: str
     labels: tuple[str, ...]
     total_size_bytes: int
     file_count: int
@@ -142,15 +90,18 @@ def discover_books(output_dir: Path = OUTPUT_DIR) -> list[BookPage]:
         if not files:
             continue
 
+        source_text = _source_text_for_labels(book_name, directory)
         visual_summary = directory / f"{book_name}_{VISUAL_SUMMARY_NAME}.html"
         visual_path = visual_summary if visual_summary.exists() else None
-        audio_assets = tuple(_discover_audio_assets(book_name, directory))
+        title, summary = _book_text(book_name, visual_path)
+        metadata = read_metadata(directory)
+        document_type = _document_type(book_name, source_text, metadata)
+        audio_assets = tuple(_discover_audio_assets(book_name, directory, document_type))
         if visual_path is None and not audio_assets:
             continue
 
         total_size_bytes = sum(path.stat().st_size for path in files)
-        title, summary = _book_text(book_name, visual_path)
-        labels = _infer_labels(book_name, title, summary)
+        labels = _labels_for_book(book_name, title, summary, source_text, document_type, metadata)
         books.append(
             BookPage(
                 book_name=book_name,
@@ -160,6 +111,7 @@ def discover_books(output_dir: Path = OUTPUT_DIR) -> list[BookPage]:
                 page_path=directory / _INDEX_NAME,
                 visual_summary_path=visual_path,
                 audio_assets=audio_assets,
+                document_type=document_type,
                 labels=labels,
                 total_size_bytes=total_size_bytes,
                 file_count=len(files),
@@ -175,7 +127,7 @@ def main() -> None:
     generate_site()
 
 
-def _discover_audio_assets(book_name: str, directory: Path) -> list[AudioAsset]:
+def _discover_audio_assets(book_name: str, directory: Path, document_type: str) -> list[AudioAsset]:
     pattern = re.compile(rf"^{re.escape(book_name)}_(.+)_(en|cs)\.mp3$", re.IGNORECASE)
     assets: list[AudioAsset] = []
     for path in sorted(directory.glob("*.mp3")):
@@ -184,6 +136,8 @@ def _discover_audio_assets(book_name: str, directory: Path) -> list[AudioAsset]:
             continue
         type_key, language = match.groups()
         if type_key not in _AUDIO_TYPES or language not in LANGUAGES:
+            continue
+        if document_type == DOCUMENT_PAPER and type_key in {"podcast_60min", "source_tts"}:
             continue
         type_label, sort_order = _AUDIO_TYPES[type_key]
         assets.append(
@@ -211,14 +165,31 @@ def _book_text(book_name: str, visual_summary_path: Path | None) -> tuple[str, s
     return title, _truncate(summary, 240)
 
 
-def _infer_labels(book_name: str, title: str, summary: str) -> tuple[str, ...]:
-    haystack = f"{book_name} {title} {summary}".casefold()
-    labels = [
-        label
-        for label, keywords in _LABEL_RULES.items()
-        if any(re.search(rf"\b{re.escape(keyword.casefold())}\b", haystack) for keyword in keywords)
-    ]
-    return tuple(labels or ("General",))
+def _source_text_for_labels(book_name: str, directory: Path) -> str:
+    source_path = directory / f"{book_name}_source_raw.md"
+    if not source_path.exists():
+        return ""
+    return source_path.read_text(encoding="utf-8", errors="ignore")[:250_000]
+
+
+def _document_type(book_name: str, source_text: str, metadata: SourceMetadata | None) -> str:
+    return infer_document_type(
+        book_name,
+        source_text,
+        explicit_document_type=metadata.document_type if metadata else None,
+    )
+
+
+def _labels_for_book(
+    book_name: str,
+    title: str,
+    summary: str,
+    source_text: str,
+    document_type: str,
+    metadata: SourceMetadata | None,
+) -> tuple[str, ...]:
+    labels = metadata.labels if metadata else classify_labels(book_name, title, summary, source_text)
+    return tuple([display_document_label(document_type), *labels])
 
 
 def _extract_tag_text(text: str, tag: str) -> str:
@@ -257,6 +228,12 @@ def _format_size(size_bytes: int) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{value:.1f} TB"
+
+
+def _count_label(count: int, singular: str, plural: str | None = None) -> str:
+    """Return a count with the right singular/plural label."""
+
+    return f"{count} {singular if count == 1 else plural or singular + 's'}"
 
 
 def _href(path: Path) -> str:
@@ -313,6 +290,7 @@ html[data-theme="dark"] {
   --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--cp-bg);
@@ -483,6 +461,8 @@ def _document_head(title: str) -> str:
 
 
 def _render_landing_page(books: list[BookPage]) -> str:
+    book_count = sum(1 for book in books if book.document_type == DOCUMENT_BOOK)
+    paper_count = sum(1 for book in books if book.document_type == DOCUMENT_PAPER)
     total_audio = sum(len(book.audio_assets) for book in books)
     total_size = sum(book.total_size_bytes for book in books)
     cards = "\n".join(_render_book_card(book) for book in books)
@@ -501,13 +481,14 @@ def _render_landing_page(books: list[BookPage]) -> str:
       <h1>Book maps and recordings</h1>
       <p class="summary">One private place for generated visual summaries, short summaries, podcasts, and full audiobook recordings.</p>
       <div class="stats" aria-label="Library statistics">
-        <span class="pill">{len(books)} books</span>
-        <span class="pill">{total_audio} recordings</span>
+        <span class="pill">{_count_label(book_count, "book")}</span>
+        <span class="pill">{_count_label(paper_count, "paper")}</span>
+        <span class="pill">{_count_label(total_audio, "recording")}</span>
         <span class="pill">{_format_size(total_size)}</span>
       </div>
     </header>
     <section class="filters" aria-label="Library filters">
-      <input class="search-input" type="search" placeholder="Search books..." aria-label="Search books" data-search>
+      <input class="search-input" type="search" placeholder="Search materials..." aria-label="Search materials" data-search>
       <div class="label-filters" aria-label="Topic filters">
         <button class="pill" type="button" data-filter="" data-active="true">All</button>
         {label_filters}
@@ -516,7 +497,7 @@ def _render_landing_page(books: list[BookPage]) -> str:
     <section class="grid" aria-label="Books" data-book-grid>
       {cards}
     </section>
-    <p class="empty-state" data-empty-state>No books match the current search.</p>
+    <p class="empty-state" data-empty-state>No materials match the current search.</p>
   </main>
   {_landing_script()}
 </body>
@@ -528,15 +509,13 @@ def _render_book_card(book: BookPage) -> str:
     page_href = _href(Path(book.book_name) / _INDEX_NAME)
     summary = f"<p>{html.escape(book.summary)}</p>" if book.summary else ""
     labels = " ".join(f'<span class="pill">{html.escape(label)}</span>' for label in book.labels)
-    search_text = f"{book.title} {book.summary} {' '.join(book.labels)}"
+    search_text = f"{book.title} {book.summary} {display_document_label(book.document_type)} {' '.join(book.labels)}"
     return f"""<a class="card" href="{page_href}" data-book-card data-labels="{html.escape('|'.join(book.labels))}" data-search-text="{html.escape(search_text.casefold())}">
   <article>
     <h2>{html.escape(book.title)}</h2>
     {summary}
     <footer>
       {labels}
-      <span class="pill">{len(book.audio_assets)} recordings</span>
-      <span class="pill">{_format_size(book.total_size_bytes)}</span>
     </footer>
   </article>
 </a>"""
@@ -558,7 +537,7 @@ def _render_book_page(book: BookPage) -> str:
 <body>
   <main class="page">
     <header class="hero">
-      <div class="eyebrow">Book detail</div>
+      <div class="eyebrow">{html.escape(display_document_label(book.document_type))} detail</div>
       <h1>{html.escape(book.title)}</h1>
       {summary}
       <div class="stats" aria-label="Book statistics">

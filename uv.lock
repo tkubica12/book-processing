@@ -116,6 +116,7 @@ dependencies = [
     { name = "openai" },
     { name = "pymupdf" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -137,6 +138,7 @@ requires-dist = [
     { name = "openai" },
     { name = "pymupdf", specifier = ">=1.27.2" },
     { name = "python-dotenv" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.49.0" },
 ]
 

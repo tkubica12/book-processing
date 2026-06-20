@@ -18,6 +18,8 @@ For every input book, the pipeline can produce:
 - cleaned-up Markdown version suitable as LLM context
 - single-file English HTML visual map with progressive disclosure
 
+For arXiv papers, the pipeline intentionally stays shorter: 5-minute summary, 20-minute summary, and 20-minute podcast only.
+
 The idea is spiral learning through reading and listening.
 
 I usually start with a 5-minute summary to understand the overall shape of the material. If the topic looks promising, I move to the 20-minute version to get the important details. From there I either stop, continue to the 20-minute or 60-minute podcast for a more guided walkthrough, or go directly to the full-length version when the book is clearly worth the time.
@@ -26,7 +28,10 @@ That cleaned-up Markdown output serves a different purpose: it becomes a high-qu
 
 ## What the pipeline does
 
-Each supported file in `input\` is treated as a separate book, and each top-level subdirectory with supported audio files is treated as one combined audio book/podcast source.
+Sources are classified by folder:
+
+- `input\arxiv\*.pdf` = arXiv papers. Put one PDF per paper directly in this folder; do not create subfolders there.
+- Everything else directly under `input\` = books. This can be a single `.pdf`, `.epub`, `.md`, `.txt`, `.mp3`, or `.m4b` file, or a top-level folder containing audio files for one book/podcast.
 
 - PDFs are extracted into Markdown with Azure Content Understanding, including document cleanup and richer structure from the source.
 - EPUB inputs are converted into Markdown with MarkItDown and then fed into the same raw source flow.
@@ -34,6 +39,7 @@ Each supported file in `input\` is treated as a separate book, and each top-leve
 - Supported audio inputs (`.mp3`, `.m4b`) are transcribed to Markdown in Stage 1 and saved into the same raw source flow as document inputs. A folder such as `input\mybook\*` is treated as one logical audio source, only audio files inside it are processed, and those files are combined in deterministic filename order into one raw output.
 - LLM processing generates summaries, translations, podcast-style scripts, and full-length text adapted for speech.
 - Text-to-speech generates matching audio files for the same hierarchy of outputs.
+- Stage 1 writes `metadata.yaml` next to each processed output. The web catalog uses that as the source of truth for document type and labels.
 
 In practice, this means a single source document becomes multiple entry points into the same content, from extremely short overview to near-complete coverage.
 
@@ -43,6 +49,7 @@ Each book gets its own subfolder named after the sanitized source filename stem.
 
 Text outputs per book:
 
+- `output\<book_name>\metadata.yaml`
 - `output\<book_name>\<book_name>_source_raw.md`
 - `output\<book_name>\<book_name>_summary_5min_en.md`, `output\<book_name>\<book_name>_summary_5min_cs.md`
 - `output\<book_name>\<book_name>_summary_20min_en.md`, `output\<book_name>\<book_name>_summary_20min_cs.md`
@@ -58,6 +65,19 @@ Audio outputs per book:
 - `output\<book_name>\<book_name>_podcast_20min_en.mp3`, `output\<book_name>\<book_name>_podcast_20min_cs.mp3`
 - `output\<book_name>\<book_name>_podcast_60min_en.mp3`, `output\<book_name>\<book_name>_podcast_60min_cs.mp3`
 - `output\<book_name>\<book_name>_source_tts_en.mp3`, `output\<book_name>\<book_name>_source_tts_cs.mp3`
+
+`metadata.yaml` schema:
+
+```yaml
+source_path: arxiv\example-paper.pdf
+document_type: paper   # book or paper
+source_medium: PDF     # PDF, ePub, audio, text
+labels:
+  - AI
+  - computers
+```
+
+Allowed topical labels are `AI`, `security`, `computers`, `biology`, `physics`, `technology`, `psychology`, and `other`. At least one label is written. Use `other` only when no specific label fits.
 
 ## Very short technical summary
 
@@ -104,7 +124,7 @@ uv sync
 
 ## Very short run
 
-Put one or more `.pdf`, `.epub`, `.md`, `.txt`, `.mp3`, or `.m4b` files into `input\`, or place multi-file audio books/podcasts inside their own subdirectory under `input\`, then run:
+Put book sources directly under `input\`, put arXiv paper PDFs directly under `input\arxiv\`, then run:
 
 ```powershell
 uv run book-processing
@@ -119,6 +139,7 @@ uv run python -m book_processing.main
 ## Notes
 
 - Stage 1 always produces `output\<book_name>\<book_name>_source_raw.md`, whether the input started as a document, a single audio file, or a folder of ordered audio tracks.
+- Stage 1 always produces `output\<book_name>\metadata.yaml` with `source_path`, `document_type`, `source_medium`, and labels.
 - Stage 1 also mirrors that normalized raw Markdown to `wiki\<book_name>.md` at the repo root.
 - Existing outputs are reused, so reruns resume instead of regenerating everything.
 - The English HTML visual summary is generated from `source_raw` and also runs for existing `output\<book_name>\*_source_raw.md` folders, even when there is no current matching input file.

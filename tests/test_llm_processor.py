@@ -13,6 +13,8 @@ from book_processing.llm_processor import (
     _recover_filtered_text,
     _sanitize_filtered_prompt,
     _split_text_for_filter_recovery,
+    is_arxiv_source,
+    summary_types_for_source,
 )
 
 
@@ -45,6 +47,32 @@ def test_split_text_for_filter_recovery_prefers_paragraph_boundaries():
 
     assert left == "Paragraph one.\n\nParagraph two."
     assert right == "Paragraph three.\n\nParagraph four."
+
+
+def test_summary_types_for_arxiv_source_skip_long_formats():
+    source = "# Paper\n\narXiv:2601.12345\n\nShort research paper."
+
+    summary_types = summary_types_for_source("sample_paper", source)
+
+    assert is_arxiv_source("sample_paper", source) is True
+    assert list(summary_types) == ["summary_5min", "summary_20min", "podcast_20min"]
+    assert "podcast_60min" not in summary_types
+
+
+def test_summary_types_for_paper_shape_skip_long_formats():
+    source = "# HyDRA\n\nAbstract\n\nA short paper.\n\n1 Introduction\n\nBody.\n\nReferences\n\nOng et al."
+
+    summary_types = summary_types_for_source("hydra_hybrid_dynamic_routing", source)
+
+    assert is_arxiv_source("hydra_hybrid_dynamic_routing", source) is True
+    assert list(summary_types) == ["summary_5min", "summary_20min", "podcast_20min"]
+
+
+def test_summary_types_for_book_include_all_formats():
+    summary_types = summary_types_for_source("sample_book", "# Book\n\nLong source.")
+
+    assert is_arxiv_source("sample_book", "# Book") is False
+    assert "podcast_60min" in summary_types
 
 
 def test_call_llm_raises_content_filter_after_sanitized_retry():

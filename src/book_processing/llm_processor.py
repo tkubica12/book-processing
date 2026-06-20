@@ -29,9 +29,13 @@ from book_processing.config import (
     book_output_dir,
     output_text_path,
 )
+from book_processing.metadata import DOCUMENT_PAPER, infer_document_type, read_metadata
 from book_processing.prompt_templates import render_prompt
 
 logger = logging.getLogger(__name__)
+ARXIV_MARKERS = ("arxiv", "arxiv.org", "arxiv:")
+PAPER_EARLY_MARKERS = ("abstract", "introduction")
+ARXIV_SUMMARY_TYPES = ("summary_5min", "summary_20min", "podcast_20min")
 
 
 class ContentFilterError(RuntimeError):
@@ -64,6 +68,35 @@ FILTER_REDACTIONS = {
 
 # Callback signature: (book_name, content_name, lang, path, is_podcast)
 FileReadyCallback = Callable[[str, str, str, Path, bool], None]
+
+
+def is_arxiv_source(book_name: str, source_md: str, explicit_document_type: str | None = None) -> bool:
+    """Return True when a source is metadata-marked or appears to be a paper."""
+
+    if explicit_document_type is not None:
+        return explicit_document_type == DOCUMENT_PAPER
+    haystack = f"{book_name} {source_md[:5000]}".casefold()
+    normalized_source = re.sub(r"\s+", " ", source_md.casefold())
+    early_source = normalized_source[:5000]
+    has_paper_shape = (
+        len(source_md) < 250_000
+        and all(marker in early_source for marker in PAPER_EARLY_MARKERS)
+        and "references" in normalized_source
+        and re.search(r"\b(?:et al\.|abstract)\b", normalized_source) is not None
+    )
+    return any(marker in haystack for marker in ARXIV_MARKERS) or has_paper_shape
+
+
+def summary_types_for_source(
+    book_name: str,
+    source_md: str,
+    explicit_document_type: str | None = None,
+) -> dict[str, dict]:
+    """Return output summary/podcast types appropriate for a source."""
+
+    if infer_document_type(book_name, source_md, explicit_document_type) == DOCUMENT_PAPER:
+        return {name: SUMMARY_TYPES[name] for name in ARXIV_SUMMARY_TYPES}
+    return SUMMARY_TYPES
 
 
 def _get_client() -> AzureOpenAI:
@@ -454,6 +487,11 @@ def run(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     source_md = source_md_path.read_text(encoding="utf-8")
+    metadata = read_metadata(book_output_dir(book_name, output_dir))
+    document_type = metadata.document_type if metadata else infer_document_type(book_name, source_md)
+    summary_types = summary_types_for_source(book_name, source_md, document_type)
+    if summary_types is not SUMMARY_TYPES:
+        logger.info("Detected arXiv paper %s; generating only 5/20-minute outputs", book_name)
     client = _get_client()
     outputs: dict[str, Path] = {}
 
@@ -462,7 +500,7 @@ def run(
     WORDS_PER_PODCAST_SECTION = 1600
 
     def _podcast_sections_for(podcast_type: str) -> list[str]:
-        target_words = SUMMARY_TYPES[podcast_type]["target_words"]
+        target_words = summary_types[podcast_type]["target_words"]
         n = max(1, target_words // WORDS_PER_PODCAST_SECTION)
         if n == 1:
             return [source_trimmed]
@@ -480,7 +518,7 @@ def run(
     podcast_needed: dict[tuple[str, str], int] = {}  # (podcast_type, lang) -> total sections
     tts_needed: dict[str, int] = {}                  # lang -> total chunks needed
 
-    for stype, spec in SUMMARY_TYPES.items():
+    for stype, spec in summary_types.items():
         if spec["is_podcast"]:
             continue
         for lang in LANGUAGES:
@@ -498,7 +536,7 @@ def run(
                 "key": key,
             })
 
-    for stype, spec in SUMMARY_TYPES.items():
+    for stype, spec in summary_types.items():
         if not spec["is_podcast"]:
             continue
         sections = _podcast_sections_for(stype)
@@ -521,23 +559,24 @@ def run(
                     "key": f"{stype}_{lang}_s{idx + 1}",
                 })
 
-    for lang in LANGUAGES:
-        path = output_text_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
-        key = f"{book_name}_{SOURCE_TTS_NAME}_{lang}"
-        if path.exists() and path.stat().st_size > 100:
-            logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
-            outputs[key] = path
-            continue
-        tts_needed[lang] = len(tts_chunks)
-        for idx in range(len(tts_chunks)):
-            all_tasks.append({
-                "type": "tts_chunk",
-                "chunk_idx": idx,
-                "total_chunks": len(tts_chunks),
-                "chunk_text": tts_chunks[idx],
-                "lang": lang,
-                "key": f"tts_{lang}_c{idx + 1}",
-            })
+    if document_type != DOCUMENT_PAPER:
+        for lang in LANGUAGES:
+            path = output_text_path(book_name, SOURCE_TTS_NAME, lang, output_dir=output_dir)
+            key = f"{book_name}_{SOURCE_TTS_NAME}_{lang}"
+            if path.exists() and path.stat().st_size > 100:
+                logger.info("Skipping %s (exists, %d bytes)", path.name, path.stat().st_size)
+                outputs[key] = path
+                continue
+            tts_needed[lang] = len(tts_chunks)
+            for idx in range(len(tts_chunks)):
+                all_tasks.append({
+                    "type": "tts_chunk",
+                    "chunk_idx": idx,
+                    "total_chunks": len(tts_chunks),
+                    "chunk_text": tts_chunks[idx],
+                    "lang": lang,
+                    "key": f"tts_{lang}_c{idx + 1}",
+                })
 
     if not all_tasks:
         logger.info("All text files already exist - nothing to do")
