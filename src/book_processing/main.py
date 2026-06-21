@@ -114,8 +114,11 @@ def main(input_dir: Path = INPUT_DIR, output_dir: Path = OUTPUT_DIR) -> None:
             }
             for future in as_completed(futures):
                 book_name = futures[future]
-                html_outputs[book_name] = future.result()
-                logger.info("HTML visualization finished for %s", book_name)
+                try:
+                    html_outputs[book_name] = future.result()
+                    logger.info("HTML visualization finished for %s", book_name)
+                except Exception as error:
+                    logger.error("HTML visualization failed for %s: %s", book_name, error)
     else:
         logger.info("No source_raw files found for HTML visualization")
     logger.info("HTML visualization complete in %.0fs: %d files", time.time() - t0_visual, len(html_outputs))

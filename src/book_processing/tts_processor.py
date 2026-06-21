@@ -300,6 +300,17 @@ class TtsJobTracker:
         with self._assembly_lock:
             return any(entry.get("pending_chunks") for entry in self._assembly.values())
 
+    def _mark_job_skipped(self, job: dict, error: RuntimeError) -> None:
+        """Drop a TTS job that exhausted retries so other jobs can finish."""
+        display = job["display"]
+        parent = job.get("parent_display")
+        if parent:
+            with self._assembly_lock:
+                self._assembly.pop(parent, None)
+            logger.error("Skipping TTS artifact %s after failed chunk %s: %s", parent, display, error)
+            return
+        logger.error("Skipping TTS artifact %s: %s", display, error)
+
     def _submit_chunk_job(
         self,
         client: httpx.Client,
@@ -389,7 +400,9 @@ class TtsJobTracker:
                         except RuntimeError as exc:
                             if self._retry_failed_job(client, headers, job, exc):
                                 continue
-                            raise
+                            self._mark_job_skipped(job, exc)
+                            completed.append(job)
+                            continue
                         if data is None:
                             if _job_has_gone_stale(job):
                                 timeout_error = RuntimeError(
@@ -398,7 +411,9 @@ class TtsJobTracker:
                                 )
                                 if self._retry_failed_job(client, headers, job, timeout_error):
                                     continue
-                                raise timeout_error
+                                self._mark_job_skipped(job, timeout_error)
+                                completed.append(job)
+                                continue
                             continue
 
                         try:
@@ -406,7 +421,9 @@ class TtsJobTracker:
                         except (ValueError, RuntimeError, httpx.HTTPError, OSError) as exc:
                             if self._retry_failed_job(client, headers, job, exc):
                                 continue
-                            raise
+                            self._mark_job_skipped(job, exc)
+                            completed.append(job)
+                            continue
                         completed.append(job)
                     for job in completed:
                         self._active.remove(job)

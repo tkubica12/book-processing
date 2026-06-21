@@ -113,7 +113,12 @@ def _get_client() -> AzureOpenAI:
 def _is_content_filter_error(error: Exception) -> bool:
     """Return True when Azure rejected the prompt due to content filtering."""
     text = str(error)
-    return "content_filter" in text or "ResponsibleAIPolicyViolation" in text
+    return (
+        "content_filter" in text
+        or "ResponsibleAIPolicyViolation" in text
+        or "cyber_policy" in text
+        or "possible cybersecurity risk" in text
+    )
 
 
 def _sanitize_filtered_prompt(prompt: str) -> str:
@@ -323,6 +328,8 @@ def _call_llm(
                 raise ContentFilterError("LLM prompt was blocked by Azure content filtering") from e
             if split_on_timeout and _is_timeout_error(e):
                 raise LlmRequestTimeoutError("LLM request timed out while generating a chunk") from e
+            if attempt == MAX_RETRIES - 1:
+                break
             wait = 30 * (attempt + 1)
             logger.warning("LLM call failed (attempt %d/%d): %s. Retrying in %ds...", attempt + 1, MAX_RETRIES, e, wait)
             time.sleep(wait)
@@ -676,6 +683,6 @@ def run(
                 _handle_result(task, text)
             except Exception as e:
                 logger.error("FAILED: %s - %s", task["key"], e)
-                raise
+                continue
 
     return outputs

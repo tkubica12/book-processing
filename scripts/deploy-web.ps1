@@ -7,10 +7,14 @@ param(
     [string]$BlobContainerName = "books",
     [string]$RegistryName = "",
     [string]$Image = "",
-    [string]$AllowedUser = "tomas@tomasonline.net",
     [string]$CustomHostname = "books.tomasonline.net",
     [string]$DnsZoneName = "tomasonline.net",
     [string]$DnsZoneResourceGroup = "rg-base",
+    [string]$GitHubOAuthClientId = $env:GITHUB_OAUTH_CLIENT_ID,
+    [string]$GitHubOAuthClientSecret = $env:GITHUB_OAUTH_CLIENT_SECRET,
+    [string]$GitHubOAuthCookieSecret = $env:GITHUB_OAUTH_COOKIE_SECRET,
+    [string]$AllowedGitHubLogin = "tkubica12",
+    [string]$AllowedGitHubEmail = "tkubica12@gmail.com",
     [string]$OutputDir = "output",
     [switch]$SkipUpload
 )
@@ -53,6 +57,7 @@ function Get-AzCopyPath {
 }
 
 $suffix = (az account show --query id -o tsv).Replace("-", "").Substring(0, 10).ToLowerInvariant()
+$tenantId = az account show --query tenantId -o tsv
 $env:PYTHONIOENCODING = "utf-8"
 $env:AZURE_CORE_NO_COLOR = "true"
 if (-not $StorageAccountName) {
@@ -239,76 +244,37 @@ if ($CustomHostname) {
         --output none
 }
 
-Write-Host "Create Entra app registration for Easy Auth"
-$tenantId = az account show --query tenantId -o tsv
-$authDisplayName = "$ContainerAppName-auth"
-$appId = az ad app list --display-name $authDisplayName --query "[0].appId" -o tsv
-if (-not $appId) {
-    $appId = az ad app create `
-        --display-name $authDisplayName `
-        --sign-in-audience AzureADMyOrg `
-        --query appId `
-        -o tsv
-    az ad sp create --id $appId --output none
+if (-not $GitHubOAuthClientId -or -not $GitHubOAuthClientSecret -or -not $GitHubOAuthCookieSecret) {
+    throw "GitHub OAuth settings are required. Set GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET, and GITHUB_OAUTH_COOKIE_SECRET or pass the matching parameters."
 }
 
-$redirectUris = @("https://$fqdn/.auth/login/aad/callback")
-if ($CustomHostname) {
-    $redirectUris += "https://$CustomHostname/.auth/login/aad/callback"
-}
-az ad app update `
-    --id $appId `
-    --enable-id-token-issuance true `
-    --web-redirect-uris $redirectUris `
-    --output none
-
-$clientSecret = az ad app credential reset `
-    --id $appId `
-    --display-name "container-apps-easy-auth" `
-    --query password `
-    -o tsv
-
-Write-Host "Limit Entra app to $AllowedUser"
-$servicePrincipalObjectId = az ad sp show --id $appId --query id -o tsv
-$userObjectId = az ad user show --id $AllowedUser --query id -o tsv
-$assignmentBody = @{
-    principalId = $userObjectId
-    resourceId = $servicePrincipalObjectId
-    appRoleId = "00000000-0000-0000-0000-000000000000"
-} | ConvertTo-Json
-$assignmentPath = Join-Path $env:TEMP "$ContainerAppName-assignment.json"
-$assignmentBody | Set-Content -Path $assignmentPath -Encoding utf8
-
-try {
-    az rest `
-        --method POST `
-        --uri "https://graph.microsoft.com/v1.0/users/$userObjectId/appRoleAssignments" `
-        --headers "Content-Type=application/json" `
-        --body "@$assignmentPath" `
-        --output none
-} catch {
-    Write-Warning "User assignment may already exist or Graph refused it. Continuing."
-}
-
-az ad sp update --id $appId --set appRoleAssignmentRequired=true --output none
-
-Write-Host "Enable Container Apps Easy Auth"
-az containerapp auth microsoft update `
+$publicBaseUrl = if ($CustomHostname) { "https://$CustomHostname" } else { "https://$fqdn" }
+Write-Host "Configure app-level GitHub OAuth for $AllowedGitHubLogin"
+az containerapp secret set `
     --name $ContainerAppName `
     --resource-group $ResourceGroup `
-    --client-id $appId `
-    --client-secret $clientSecret `
-    --tenant-id $tenantId `
-    --yes `
+    --secrets "github-oauth-client-secret=$GitHubOAuthClientSecret" "github-oauth-cookie-secret=$GitHubOAuthCookieSecret" `
     --output none
 
+az containerapp update `
+    --name $ContainerAppName `
+    --resource-group $ResourceGroup `
+    --set-env-vars `
+        "STORAGE_ACCOUNT_NAME=$StorageAccountName" `
+        "BLOB_CONTAINER_NAME=$BlobContainerName" `
+        "PUBLIC_BASE_URL=$publicBaseUrl" `
+        "GITHUB_OAUTH_CLIENT_ID=$GitHubOAuthClientId" `
+        "GITHUB_OAUTH_CLIENT_SECRET=secretref:github-oauth-client-secret" `
+        "GITHUB_OAUTH_COOKIE_SECRET=secretref:github-oauth-cookie-secret" `
+        "ALLOWED_GITHUB_LOGIN=$AllowedGitHubLogin" `
+        "ALLOWED_GITHUB_EMAIL=$AllowedGitHubEmail" `
+    --output none
+
+Write-Host "Disable Container Apps Easy Auth (GitHub OAuth is enforced in the app)"
 az containerapp auth update `
     --name $ContainerAppName `
     --resource-group $ResourceGroup `
-    --enabled true `
-    --unauthenticated-client-action RedirectToLoginPage `
-    --redirect-provider AzureActiveDirectory `
-    --require-https true `
+    --enabled false `
     --yes `
     --output none
 

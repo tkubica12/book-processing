@@ -2,21 +2,177 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator
+import hashlib
+import hmac
+import json
 import mimetypes
 import os
+import secrets
+import time
+from typing import Any
 from urllib.parse import unquote
+from urllib.parse import urlencode
 
 from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContainerClient
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+import httpx
+from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 
 _CHUNK_SIZE = 1024 * 1024
 _DEFAULT_CONTAINER = "books"
+_SESSION_COOKIE = "book_site_session"
+_STATE_COOKIE = "book_site_oauth_state"
+_SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
+_GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+_GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+_GITHUB_API_URL = "https://api.github.com"
 
 app = FastAPI(title="Book processing private site")
+
+
+def _public_base_url(request: Request) -> str:
+    return os.getenv("PUBLIC_BASE_URL", str(request.base_url).rstrip("/")).rstrip("/")
+
+
+def _allowed_github_login() -> str:
+    return os.getenv("ALLOWED_GITHUB_LOGIN", "tkubica12").strip().casefold()
+
+
+def _allowed_github_email() -> str:
+    return os.getenv("ALLOWED_GITHUB_EMAIL", "tkubica12@gmail.com").strip().casefold()
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} must be configured")
+    return value
+
+
+def _cookie_secret() -> str:
+    return _required_env("GITHUB_OAUTH_COOKIE_SECRET")
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def _sign(value: str) -> str:
+    digest = hmac.new(_cookie_secret().encode("utf-8"), value.encode("utf-8"), hashlib.sha256).digest()
+    return _b64url_encode(digest)
+
+
+def _encode_signed_payload(payload: dict[str, Any]) -> str:
+    body = _b64url_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    return f"{body}.{_sign(body)}"
+
+
+def _decode_signed_payload(value: str | None) -> dict[str, Any] | None:
+    if not value or "." not in value:
+        return None
+    body, signature = value.rsplit(".", 1)
+    if not hmac.compare_digest(signature, _sign(body)):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(body))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _make_session(login: str, email: str) -> str:
+    return _encode_signed_payload({
+        "login": login,
+        "email": email,
+        "exp": int(time.time()) + _SESSION_TTL_SECONDS,
+    })
+
+
+def _valid_session(request: Request) -> bool:
+    session = _decode_signed_payload(request.cookies.get(_SESSION_COOKIE))
+    if not session:
+        return False
+    if int(session.get("exp", 0)) < int(time.time()):
+        return False
+    login = str(session.get("login", "")).casefold()
+    email = str(session.get("email", "")).casefold()
+    return login == _allowed_github_login() and email == _allowed_github_email()
+
+
+def _login_redirect(request: Request) -> RedirectResponse:
+    return_to = str(request.url)
+    state = secrets.token_urlsafe(32)
+    state_cookie = _encode_signed_payload({
+        "state": state,
+        "return_to": return_to,
+        "exp": int(time.time()) + 600,
+    })
+    query = urlencode({
+        "client_id": _required_env("GITHUB_OAUTH_CLIENT_ID"),
+        "redirect_uri": f"{_public_base_url(request)}/oauth/github/callback",
+        "scope": "read:user user:email",
+        "state": state,
+    })
+    response = RedirectResponse(f"{_GITHUB_AUTHORIZE_URL}?{query}", status_code=302)
+    response.set_cookie(_STATE_COOKIE, state_cookie, httponly=True, secure=True, samesite="lax", max_age=600)
+    return response
+
+
+def _github_user_and_verified_email(access_token: str) -> tuple[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {access_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    with httpx.Client(timeout=20.0) as client:
+        user_response = client.get(f"{_GITHUB_API_URL}/user", headers=headers)
+        user_response.raise_for_status()
+        user = user_response.json()
+        emails_response = client.get(f"{_GITHUB_API_URL}/user/emails", headers=headers)
+        emails_response.raise_for_status()
+        emails = emails_response.json()
+    login = str(user.get("login", "")).strip()
+    verified_emails = {
+        str(item.get("email", "")).strip().casefold()
+        for item in emails
+        if isinstance(item, dict) and item.get("verified")
+    }
+    allowed_email = _allowed_github_email()
+    if allowed_email not in verified_emails:
+        raise HTTPException(status_code=403, detail="Required GitHub email is not verified on this account")
+    return login, allowed_email
+
+
+def _exchange_code_for_token(code: str, request: Request) -> str:
+    body = {
+        "client_id": _required_env("GITHUB_OAUTH_CLIENT_ID"),
+        "client_secret": _required_env("GITHUB_OAUTH_CLIENT_SECRET"),
+        "code": code,
+        "redirect_uri": f"{_public_base_url(request)}/oauth/github/callback",
+    }
+    headers = {"Accept": "application/json"}
+    with httpx.Client(timeout=20.0) as client:
+        response = client.post(_GITHUB_TOKEN_URL, data=body, headers=headers)
+        response.raise_for_status()
+    token_payload = response.json()
+    access_token = token_payload.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise HTTPException(status_code=401, detail="GitHub did not return an access token")
+    return access_token
+
+
+def _require_authenticated(request: Request) -> RedirectResponse | None:
+    if _valid_session(request):
+        return None
+    return _login_redirect(request)
 
 
 def _container_client() -> ContainerClient:
@@ -87,10 +243,62 @@ def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/login")
+def login(request: Request) -> RedirectResponse:
+    """Start GitHub OAuth login."""
+
+    return _login_redirect(request)
+
+
+@app.get("/oauth/github/callback")
+def github_oauth_callback(request: Request, code: str = "", state: str = "") -> Response:
+    """Complete GitHub OAuth login and issue a signed local session cookie."""
+
+    state_payload = _decode_signed_payload(request.cookies.get(_STATE_COOKIE))
+    if (
+        not state_payload
+        or int(state_payload.get("exp", 0)) < int(time.time())
+        or not hmac.compare_digest(str(state_payload.get("state", "")), state)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid OAuth state")
+    if not code:
+        raise HTTPException(status_code=401, detail="Missing OAuth code")
+
+    access_token = _exchange_code_for_token(code, request)
+    login_name, email = _github_user_and_verified_email(access_token)
+    if login_name.casefold() != _allowed_github_login():
+        raise HTTPException(status_code=403, detail="GitHub account is not authorized")
+
+    response = RedirectResponse(str(state_payload.get("return_to") or "/"), status_code=302)
+    response.set_cookie(
+        _SESSION_COOKIE,
+        _make_session(login_name, email),
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=_SESSION_TTL_SECONDS,
+    )
+    response.delete_cookie(_STATE_COOKIE)
+    return response
+
+
+@app.get("/logout")
+def logout() -> PlainTextResponse:
+    """Clear the local application session."""
+
+    response = PlainTextResponse("Signed out")
+    response.delete_cookie(_SESSION_COOKIE)
+    response.delete_cookie(_STATE_COOKIE)
+    return response
+
+
 @app.api_route("/{path:path}", methods=["GET", "HEAD"])
 def serve_blob(request: Request, path: str, range_header: str | None = Header(default=None, alias="Range")):
     """Serve a generated static file or audio blob with range request support."""
 
+    auth_redirect = _require_authenticated(request)
+    if auth_redirect is not None:
+        return auth_redirect
     blob_name = _blob_name_from_path(path)
     container = _container_client()
     blob = container.get_blob_client(blob_name)
