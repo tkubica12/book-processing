@@ -148,11 +148,21 @@ Do not disable Easy Auth before the container image includes the app-level OAuth
 11. Configure ingress to app port.
 12. Configure GitHub OAuth env vars and Container Apps secrets.
 13. Disable Container Apps Easy Auth after the app-level OAuth gate is deployed.
-14. Upload files with AzCopy using Entra login:
+14. Keep storage account `publicNetworkAccess` enabled unless the Container App is integrated with a VNet/private endpoint path to the storage account. This does not make blobs public; blob public access and shared-key access remain disabled, and both upload and runtime reads use Entra/RBAC.
+15. Upload files with AzCopy using Entra login:
 
 ```powershell
+az storage account update `
+  --name <storage> `
+  --resource-group <resource-group> `
+  --public-network-access Enabled `
+  --allow-blob-public-access false `
+  --allow-shared-key-access false
+
 azcopy login --tenant-id <tenant-id>
 azcopy sync output https://<storage>.blob.core.windows.net/<container> --recursive=true --delete-destination=true
+
+azcopy set-properties https://<storage>.blob.core.windows.net/<container> --block-blob-tier=Cold --recursive=true
 ```
 
 ## Custom domain

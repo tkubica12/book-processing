@@ -88,6 +88,13 @@ if (-not (Test-AzResource { az storage account show --name $StorageAccountName -
         --allow-shared-key-access false `
         --output none
 }
+az storage account update `
+    --name $StorageAccountName `
+    --resource-group $ResourceGroup `
+    --public-network-access Enabled `
+    --allow-blob-public-access false `
+    --allow-shared-key-access false `
+    --output none
 
 az storage container-rm create `
     --resource-group $ResourceGroup `
@@ -286,6 +293,11 @@ if (-not $SkipUpload) {
     Write-Host "Upload output to private Blob Storage"
     $azCopyPath = Get-AzCopyPath
     $destination = "https://$StorageAccountName.blob.core.windows.net/$BlobContainerName"
+    az storage account update `
+        --name $StorageAccountName `
+        --resource-group $ResourceGroup `
+        --public-network-access Enabled `
+        --output none
     & $azCopyPath sync $OutputDir $destination --recursive=true --delete-destination=true
     if ($LASTEXITCODE -ne 0) {
         throw "AzCopy sync failed with exit code $LASTEXITCODE. Run: $azCopyPath login --tenant-id $tenantId"
