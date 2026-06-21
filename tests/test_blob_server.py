@@ -60,6 +60,28 @@ def test_github_session_allows_configured_user(monkeypatch):
     assert _require_authenticated(_request_with_cookie(session)) is None
 
 
+def test_github_session_allows_comma_separated_logins_without_email_restriction(monkeypatch):
+    monkeypatch.setenv("GITHUB_OAUTH_COOKIE_SECRET", "test-secret")
+    monkeypatch.setenv("ALLOWED_GITHUB_LOGINS", "tkubica12, octocat")
+    monkeypatch.delenv("ALLOWED_GITHUB_EMAILS", raising=False)
+    session = _make_session("octocat", "octocat@example.com")
+
+    assert _require_authenticated(_request_with_cookie(session)) is None
+
+
+def test_github_session_enforces_comma_separated_email_allowlist(monkeypatch):
+    monkeypatch.setenv("GITHUB_OAUTH_COOKIE_SECRET", "test-secret")
+    monkeypatch.setenv("GITHUB_OAUTH_CLIENT_ID", "client-id")
+    monkeypatch.setenv("ALLOWED_GITHUB_LOGINS", "tkubica12, octocat")
+    monkeypatch.setenv("ALLOWED_GITHUB_EMAILS", "tkubica12@gmail.com, allowed@example.com")
+    session = _make_session("octocat", "octocat@example.com")
+
+    response = _require_authenticated(_request_with_cookie(session))
+
+    assert response is not None
+    assert response.status_code == 302
+
+
 def test_github_session_rejects_other_user(monkeypatch):
     monkeypatch.setenv("GITHUB_OAUTH_COOKIE_SECRET", "test-secret")
     monkeypatch.setenv("GITHUB_OAUTH_CLIENT_ID", "client-id")

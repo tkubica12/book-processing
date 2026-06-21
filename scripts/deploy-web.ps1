@@ -13,8 +13,8 @@ param(
     [string]$GitHubOAuthClientId = $env:GITHUB_OAUTH_CLIENT_ID,
     [string]$GitHubOAuthClientSecret = $env:GITHUB_OAUTH_CLIENT_SECRET,
     [string]$GitHubOAuthCookieSecret = $env:GITHUB_OAUTH_COOKIE_SECRET,
-    [string]$AllowedGitHubLogin = "tkubica12",
-    [string]$AllowedGitHubEmail = "tkubica12@gmail.com",
+    [string]$AllowedGitHubLogins = "tkubica12",
+    [string]$AllowedGitHubEmails = "",
     [string]$OutputDir = "output",
     [switch]$SkipUpload
 )
@@ -256,7 +256,7 @@ if (-not $GitHubOAuthClientId -or -not $GitHubOAuthClientSecret -or -not $GitHub
 }
 
 $publicBaseUrl = if ($CustomHostname) { "https://$CustomHostname" } else { "https://$fqdn" }
-Write-Host "Configure app-level GitHub OAuth for $AllowedGitHubLogin"
+Write-Host "Configure app-level GitHub OAuth for $AllowedGitHubLogins"
 az containerapp secret set `
     --name $ContainerAppName `
     --resource-group $ResourceGroup `
@@ -273,8 +273,8 @@ az containerapp update `
         "GITHUB_OAUTH_CLIENT_ID=$GitHubOAuthClientId" `
         "GITHUB_OAUTH_CLIENT_SECRET=secretref:github-oauth-client-secret" `
         "GITHUB_OAUTH_COOKIE_SECRET=secretref:github-oauth-cookie-secret" `
-        "ALLOWED_GITHUB_LOGIN=$AllowedGitHubLogin" `
-        "ALLOWED_GITHUB_EMAIL=$AllowedGitHubEmail" `
+        "ALLOWED_GITHUB_LOGINS=$AllowedGitHubLogins" `
+        "ALLOWED_GITHUB_EMAILS=$AllowedGitHubEmails" `
     --output none
 
 Write-Host "Disable Container Apps Easy Auth (GitHub OAuth is enforced in the app)"

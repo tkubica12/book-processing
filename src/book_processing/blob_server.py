@@ -38,12 +38,23 @@ def _public_base_url(request: Request) -> str:
     return os.getenv("PUBLIC_BASE_URL", str(request.base_url).rstrip("/")).rstrip("/")
 
 
-def _allowed_github_login() -> str:
-    return os.getenv("ALLOWED_GITHUB_LOGIN", "tkubica12").strip().casefold()
+def _csv_env_values(name: str) -> set[str]:
+    return {item.strip().casefold() for item in os.getenv(name, "").split(",") if item.strip()}
 
 
-def _allowed_github_email() -> str:
-    return os.getenv("ALLOWED_GITHUB_EMAIL", "tkubica12@gmail.com").strip().casefold()
+def _allowed_github_logins() -> set[str]:
+    return _csv_env_values("ALLOWED_GITHUB_LOGINS") or {"tkubica12"}
+
+
+def _allowed_github_emails() -> set[str]:
+    return _csv_env_values("ALLOWED_GITHUB_EMAILS")
+
+
+def _github_identity_is_allowed(login: str, verified_emails: set[str]) -> bool:
+    if login.casefold() not in _allowed_github_logins():
+        return False
+    allowed_emails = _allowed_github_emails()
+    return not allowed_emails or bool(verified_emails & allowed_emails)
 
 
 def _required_env(name: str) -> str:
@@ -104,7 +115,8 @@ def _valid_session(request: Request) -> bool:
         return False
     login = str(session.get("login", "")).casefold()
     email = str(session.get("email", "")).casefold()
-    return login == _allowed_github_login() and email == _allowed_github_email()
+    verified_emails = {email} if email else set()
+    return _github_identity_is_allowed(login, verified_emails)
 
 
 def _login_redirect(request: Request) -> RedirectResponse:
@@ -145,10 +157,11 @@ def _github_user_and_verified_email(access_token: str) -> tuple[str, str]:
         for item in emails
         if isinstance(item, dict) and item.get("verified")
     }
-    allowed_email = _allowed_github_email()
-    if allowed_email not in verified_emails:
+    allowed_emails = _allowed_github_emails()
+    matched_allowed_emails = verified_emails & allowed_emails
+    if allowed_emails and not matched_allowed_emails:
         raise HTTPException(status_code=403, detail="Required GitHub email is not verified on this account")
-    return login, allowed_email
+    return login, next(iter(matched_allowed_emails or verified_emails), "")
 
 
 def _exchange_code_for_token(code: str, request: Request) -> str:
@@ -266,7 +279,8 @@ def github_oauth_callback(request: Request, code: str = "", state: str = "") -> 
 
     access_token = _exchange_code_for_token(code, request)
     login_name, email = _github_user_and_verified_email(access_token)
-    if login_name.casefold() != _allowed_github_login():
+    verified_emails = {email} if email else set()
+    if not _github_identity_is_allowed(login_name, verified_emails):
         raise HTTPException(status_code=403, detail="GitHub account is not authorized")
 
     response = RedirectResponse(str(state_payload.get("return_to") or "/"), status_code=302)

@@ -22,7 +22,7 @@ Request flow:
 2. FastAPI redirects unauthenticated users to GitHub OAuth.
 3. GitHub redirects back to `/oauth/github/callback`.
 4. App exchanges the code for a GitHub token and calls GitHub `/user` and `/user/emails`.
-5. App allows only the configured GitHub login and verified email.
+5. App allows only configured GitHub handles, with optional verified-email restrictions.
 6. App issues a signed, HTTP-only, Secure local session cookie.
 7. App maps URL path to blob name.
 8. App streams blob from private Blob Storage using managed identity.
@@ -53,10 +53,11 @@ The web app should:
 - Use `DefaultAzureCredential`.
 - Implement app-level GitHub OAuth:
   - `/login` starts OAuth.
-  - `/oauth/github/callback` validates state, exchanges code, verifies GitHub login/email, and issues a signed session cookie.
+  - `/oauth/github/callback` validates state, exchanges code, verifies the GitHub identity, and issues a signed session cookie.
   - `/logout` clears local cookies.
   - all blob-serving routes require a valid signed session cookie.
-  - only the configured GitHub login and verified email are allowed.
+  - only configured GitHub handles are allowed.
+  - optionally, require the account to also have one of the configured verified email addresses.
 
 Python packages:
 
@@ -92,8 +93,10 @@ The app expects these settings:
 - `GITHUB_OAUTH_CLIENT_ID`: GitHub OAuth App client ID
 - `GITHUB_OAUTH_CLIENT_SECRET`: GitHub OAuth App client secret
 - `GITHUB_OAUTH_COOKIE_SECRET`: random signing secret for local session cookies
-- `ALLOWED_GITHUB_LOGIN`: allowed GitHub username, for example `tkubica12`
-- `ALLOWED_GITHUB_EMAIL`: required verified GitHub email, for example `tkubica12@gmail.com`
+- `ALLOWED_GITHUB_LOGINS`: comma-separated allowed GitHub usernames, for example `tkubica12,octocat`
+- `ALLOWED_GITHUB_EMAILS`: optional comma-separated verified GitHub emails. Leave empty to authorize by GitHub handle only.
+
+Prefer `ALLOWED_GITHUB_LOGINS` as the main access list because GitHub login is the identity users see and manage. `ALLOWED_GITHUB_EMAILS` is optional defense-in-depth: use it when you want to require that an allowed account also owns a specific verified email. It is not required for normal multi-user access and can be inconvenient because users may hide or change their GitHub email configuration.
 
 Store secrets as Container Apps secrets and reference them from env vars:
 
@@ -113,8 +116,8 @@ az containerapp update `
     "GITHUB_OAUTH_CLIENT_ID=<github-client-id>" `
     "GITHUB_OAUTH_CLIENT_SECRET=secretref:github-oauth-client-secret" `
     "GITHUB_OAUTH_COOKIE_SECRET=secretref:github-oauth-cookie-secret" `
-    "ALLOWED_GITHUB_LOGIN=tkubica12" `
-    "ALLOWED_GITHUB_EMAIL=tkubica12@gmail.com"
+    "ALLOWED_GITHUB_LOGINS=tkubica12,octocat" `
+    "ALLOWED_GITHUB_EMAILS="
 ```
 
 Disable Container Apps Easy Auth when the app-level OAuth gate is deployed:
