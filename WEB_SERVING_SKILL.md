@@ -14,6 +14,7 @@ Use this pattern when a project produces static HTML/media artifacts that must b
 - Managed identity gets `Storage Blob Data Reader` on the storage account.
 - App code reads blobs with Azure SDK + `DefaultAzureCredential`.
 - Browser never receives blob keys, SAS URLs, or direct blob URLs.
+- Storage account `publicNetworkAccess` must stay enabled unless ACA has a VNet/private endpoint route to the storage account. This only exposes the Blob service endpoint to authenticated callers; blobs are still private because anonymous blob access and shared keys are disabled.
 
 Request flow:
 
@@ -206,3 +207,53 @@ curl.exe -I -H "Range: bytes=0-99" https://<site>/<file>.mp3
 ```
 
 Good result: `206 Partial Content`.
+
+## Troubleshooting
+
+### Internal Server Error after successful GitHub login
+
+If login succeeds but the first page returns `500 Internal Server Error`, check the Container App logs. This traceback means the app-level GitHub OAuth succeeded, but the web container cannot read from Blob Storage:
+
+```text
+azure.core.exceptions.HttpResponseError: Operation returned an invalid status 'This request is not authorized to perform this operation.'
+ErrorCode:AuthorizationFailure
+```
+
+Check both RBAC and storage networking:
+
+```powershell
+az containerapp show `
+  --name <app> `
+  --resource-group <rg> `
+  --query identity.principalId `
+  -o tsv
+
+az role assignment list `
+  --scope $(az storage account show --name <storage> --resource-group <rg> --query id -o tsv) `
+  --include-inherited `
+  --query "[?roleDefinitionName=='Storage Blob Data Reader']"
+
+az storage account show `
+  --name <storage> `
+  --resource-group <rg> `
+  --query "{publicNetworkAccess:publicNetworkAccess,allowBlobPublicAccess:allowBlobPublicAccess,allowSharedKey:allowSharedKeyAccess}"
+```
+
+For this architecture, the app identity needs `Storage Blob Data Reader`, and the storage account must have:
+
+```text
+publicNetworkAccess = Enabled
+allowBlobPublicAccess = false
+allowSharedKeyAccess = false
+```
+
+If `publicNetworkAccess` is `Disabled` and ACA is not integrated with a private endpoint/VNet path, enable it:
+
+```powershell
+az storage account update `
+  --name <storage> `
+  --resource-group <rg> `
+  --public-network-access Enabled `
+  --allow-blob-public-access false `
+  --allow-shared-key-access false
+```
