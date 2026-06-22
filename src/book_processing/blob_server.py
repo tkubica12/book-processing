@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from collections.abc import Iterator
 import hashlib
 import hmac
@@ -14,6 +15,7 @@ import time
 from typing import Any
 from urllib.parse import unquote
 from urllib.parse import urlencode
+from urllib.parse import urlsplit
 
 from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
@@ -34,8 +36,32 @@ _GITHUB_API_URL = "https://api.github.com"
 app = FastAPI(title="Book processing private site")
 
 
+class _OAuthRenewRequired(Exception):
+    """Raised when the browser should restart the OAuth login flow."""
+
+
 def _public_base_url(request: Request) -> str:
     return os.getenv("PUBLIC_BASE_URL", str(request.base_url).rstrip("/")).rstrip("/")
+
+
+def _public_request_url(request: Request) -> str:
+    query = f"?{request.url.query}" if request.url.query else ""
+    return f"{_public_base_url(request)}{request.url.path}{query}"
+
+
+def _safe_return_to(request: Request, value: str | None) -> str:
+    base_url = _public_base_url(request)
+    if not value:
+        return f"{base_url}/"
+
+    parsed = urlsplit(value)
+    if not parsed.netloc:
+        return f"{base_url}/{value.lstrip('/')}"
+
+    base = urlsplit(base_url)
+    if parsed.scheme == base.scheme and parsed.netloc == base.netloc:
+        return value
+    return f"{base_url}/"
 
 
 def _csv_env_values(name: str) -> set[str]:
@@ -94,7 +120,7 @@ def _decode_signed_payload(value: str | None) -> dict[str, Any] | None:
         return None
     try:
         payload = json.loads(_b64url_decode(body))
-    except (ValueError, json.JSONDecodeError):
+    except (binascii.Error, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -111,7 +137,11 @@ def _valid_session(request: Request) -> bool:
     session = _decode_signed_payload(request.cookies.get(_SESSION_COOKIE))
     if not session:
         return False
-    if int(session.get("exp", 0)) < int(time.time()):
+    try:
+        expires_at = int(session.get("exp", 0))
+    except (TypeError, ValueError):
+        return False
+    if expires_at < int(time.time()):
         return False
     login = str(session.get("login", "")).casefold()
     email = str(session.get("email", "")).casefold()
@@ -119,8 +149,8 @@ def _valid_session(request: Request) -> bool:
     return _github_identity_is_allowed(login, verified_emails)
 
 
-def _login_redirect(request: Request) -> RedirectResponse:
-    return_to = str(request.url)
+def _login_redirect(request: Request, return_to: str | None = None) -> RedirectResponse:
+    return_to = _safe_return_to(request, return_to or _public_request_url(request))
     state = secrets.token_urlsafe(32)
     state_cookie = _encode_signed_payload({
         "state": state,
@@ -146,9 +176,13 @@ def _github_user_and_verified_email(access_token: str) -> tuple[str, str]:
     }
     with httpx.Client(timeout=20.0) as client:
         user_response = client.get(f"{_GITHUB_API_URL}/user", headers=headers)
+        if user_response.status_code == 401:
+            raise _OAuthRenewRequired()
         user_response.raise_for_status()
         user = user_response.json()
         emails_response = client.get(f"{_GITHUB_API_URL}/user/emails", headers=headers)
+        if emails_response.status_code == 401:
+            raise _OAuthRenewRequired()
         emails_response.raise_for_status()
         emails = emails_response.json()
     login = str(user.get("login", "")).strip()
@@ -174,18 +208,24 @@ def _exchange_code_for_token(code: str, request: Request) -> str:
     headers = {"Accept": "application/json"}
     with httpx.Client(timeout=20.0) as client:
         response = client.post(_GITHUB_TOKEN_URL, data=body, headers=headers)
+        if response.status_code == 400:
+            token_payload = response.json()
+            if token_payload.get("error") == "bad_verification_code":
+                raise _OAuthRenewRequired()
         response.raise_for_status()
     token_payload = response.json()
     access_token = token_payload.get("access_token")
     if not isinstance(access_token, str) or not access_token:
-        raise HTTPException(status_code=401, detail="GitHub did not return an access token")
+        raise _OAuthRenewRequired()
     return access_token
 
 
 def _require_authenticated(request: Request) -> RedirectResponse | None:
     if _valid_session(request):
         return None
-    return _login_redirect(request)
+    response = _login_redirect(request)
+    response.delete_cookie(_SESSION_COOKIE)
+    return response
 
 
 def _container_client() -> ContainerClient:
@@ -260,7 +300,8 @@ def healthz() -> dict[str, str]:
 def login(request: Request) -> RedirectResponse:
     """Start GitHub OAuth login."""
 
-    return _login_redirect(request)
+    return_to = request.query_params.get("return_to") or f"{_public_base_url(request)}/"
+    return _login_redirect(request, return_to=return_to)
 
 
 @app.get("/oauth/github/callback")
@@ -273,12 +314,17 @@ def github_oauth_callback(request: Request, code: str = "", state: str = "") -> 
         or int(state_payload.get("exp", 0)) < int(time.time())
         or not hmac.compare_digest(str(state_payload.get("state", "")), state)
     ):
-        raise HTTPException(status_code=401, detail="Invalid OAuth state")
+        return _login_redirect(request, return_to=f"{_public_base_url(request)}/")
     if not code:
-        raise HTTPException(status_code=401, detail="Missing OAuth code")
+        return _login_redirect(request, return_to=str(state_payload.get("return_to") or f"{_public_base_url(request)}/"))
 
-    access_token = _exchange_code_for_token(code, request)
-    login_name, email = _github_user_and_verified_email(access_token)
+    try:
+        access_token = _exchange_code_for_token(code, request)
+        login_name, email = _github_user_and_verified_email(access_token)
+    except _OAuthRenewRequired:
+        response = _login_redirect(request, return_to=str(state_payload.get("return_to") or f"{_public_base_url(request)}/"))
+        response.delete_cookie(_SESSION_COOKIE)
+        return response
     verified_emails = {email} if email else set()
     if not _github_identity_is_allowed(login_name, verified_emails):
         raise HTTPException(status_code=403, detail="GitHub account is not authorized")
