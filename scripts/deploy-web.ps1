@@ -16,6 +16,7 @@ param(
     [string]$AllowedGitHubLogins = "tkubica12",
     [string]$AllowedGitHubEmails = "",
     [string]$OutputDir = "output",
+    [switch]$SkipStorageNetworkPolicyExemption,
     [switch]$SkipUpload
 )
 
@@ -108,6 +109,27 @@ $storageId = az storage account show `
     --resource-group $ResourceGroup `
     --query id `
     -o tsv
+
+if (-not $SkipStorageNetworkPolicyExemption) {
+    Write-Host "Create targeted storage network policy exemption"
+    $subscriptionId = az account show --query id -o tsv
+    $securityCenterAssignment = "/subscriptions/$subscriptionId/providers/Microsoft.Authorization/policyAssignments/SecurityCenterBuiltIn"
+    if (-not (Test-AzResource { az policy exemption show --name "booksite-aca-proxy-storage-network" --scope $storageId })) {
+        az policy exemption create `
+            --name "booksite-aca-proxy-storage-network" `
+            --scope $storageId `
+            --policy-assignment $securityCenterAssignment `
+            --exemption-category Waiver `
+            --display-name "Book site ACA proxy storage network exception" `
+            --description "This storage account serves private content only through ACA app-level OAuth proxy. Blob public access and shared keys are disabled; ACA managed identity uses Storage Blob Data Reader. Public network access is required unless ACA is moved to VNet private endpoint." `
+            --policy-definition-reference-ids `
+                "storageAccountsShouldRestrictNetworkAccessUsingVirtualNetworkRulesMonitoringEffect" `
+                "storageAccountsShouldRestrictNetworkAccessUsingVirtualNetworkRulesExDataBricksMonitoringEffect" `
+                "storageAccountShouldUseAPrivateLinkConnectionMonitoringEffect" `
+                "storageAccountShouldUseAPrivateLinkConnectionExDataBricksMonitoringEffect" `
+            --output none
+    }
+}
 
 if ($Image.StartsWith("ghcr.io/")) {
     Write-Host "Use public GHCR image $Image"
