@@ -27,6 +27,7 @@ from book_processing.config import (
     wiki_text_path,
 )
 from book_processing.metadata import (
+    DEFAULT_ADDED_DATE,
     DOCUMENT_BOOK,
     DOCUMENT_PAPER,
     SOURCE_MEDIUM_AUDIO,
@@ -35,6 +36,8 @@ from book_processing.metadata import (
     SOURCE_MEDIUM_TEXT,
     SourceMetadata,
     classify_labels,
+    read_metadata,
+    today_added_date,
     write_metadata,
 )
 
@@ -287,16 +290,21 @@ def _write_source_metadata(
     input_dir: Path,
     output_dir: Path,
     source_md: str,
+    added_date: str,
 ) -> Path:
     """Write metadata.yaml for a processed source."""
 
+    book_dir = book_output_dir(book_name, output_dir)
+    existing_metadata = read_metadata(book_dir)
+    document_type = _document_type_for_source(source_path, input_dir)
     metadata = SourceMetadata(
         source_path=_source_path_for_metadata(source_path, input_dir),
-        document_type=_document_type_for_source(source_path, input_dir),
+        document_type=document_type,
         source_medium=_source_medium_for_source(source_path),
-        labels=classify_labels(book_name, source_text=source_md[:250_000]),
+        added_date=existing_metadata.added_date if existing_metadata else added_date,
+        labels=["AI"] if document_type == DOCUMENT_PAPER else classify_labels(book_name, source_text=source_md[:250_000]),
     )
-    return write_metadata(book_output_dir(book_name, output_dir), metadata)
+    return write_metadata(book_dir, metadata)
 
 
 def _process_pdf(pdf_path: Path, output_dir: Path) -> tuple[str, Path]:
@@ -398,6 +406,7 @@ def _process_source(source_path: Path, input_dir: Path, output_dir: Path) -> tup
             input_dir,
             output_dir,
             existing_raw.read_text(encoding="utf-8", errors="ignore"),
+            DEFAULT_ADDED_DATE,
         )
         wiki_path = wiki_text_path(book_name, output_dir=output_dir)
         if not wiki_path.exists():
@@ -428,6 +437,7 @@ def _process_source(source_path: Path, input_dir: Path, output_dir: Path) -> tup
         input_dir,
         output_dir,
         output_path.read_text(encoding="utf-8", errors="ignore"),
+        today_added_date(),
     )
     return book_name, output_path
 

@@ -8,7 +8,7 @@ import pytest
 from book_processing.content_understanding import ContentUnderstandingNoUsableMarkdownError
 from book_processing.config import SOURCE_RAW_NAME, wiki_text_path
 from book_processing.audio_transcriber import InvalidAudioSourceError
-from book_processing.metadata import read_metadata
+from book_processing.metadata import DEFAULT_ADDED_DATE, read_metadata
 from book_processing.pdf_converter import (
     convert_epub_to_markdown,
     convert_pdf_to_markdown,
@@ -97,6 +97,7 @@ def test_run_copies_markdown_inputs_to_source_raw(tmp_path: Path):
     assert metadata.source_path == "The Book.md"
     assert metadata.document_type == "book"
     assert metadata.source_medium == "text"
+    assert metadata.added_date != DEFAULT_ADDED_DATE
     assert metadata.labels
 
 
@@ -121,6 +122,7 @@ def test_run_writes_paper_metadata_for_arxiv_pdf(monkeypatch, tmp_path: Path):
     assert metadata.source_path == "arxiv\\HyDRA.pdf"
     assert metadata.document_type == "paper"
     assert metadata.source_medium == "PDF"
+    assert metadata.added_date != DEFAULT_ADDED_DATE
     assert "AI" in metadata.labels
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 import html
 import logging
 import re
@@ -11,6 +12,7 @@ from urllib.parse import quote
 
 from book_processing.config import LANGUAGES, OUTPUT_DIR, VISUAL_SUMMARY_NAME
 from book_processing.metadata import (
+    DEFAULT_ADDED_DATE,
     DOCUMENT_BOOK,
     DOCUMENT_PAPER,
     SourceMetadata,
@@ -58,6 +60,7 @@ class BookPage:
     audio_assets: tuple[AudioAsset, ...]
     document_type: str
     labels: tuple[str, ...]
+    added_date: str
     total_size_bytes: int
     file_count: int
 
@@ -102,6 +105,7 @@ def discover_books(output_dir: Path = OUTPUT_DIR) -> list[BookPage]:
 
         total_size_bytes = sum(path.stat().st_size for path in files)
         labels = _labels_for_book(book_name, title, summary, source_text, document_type, metadata)
+        added_date = metadata.added_date if metadata else DEFAULT_ADDED_DATE
         books.append(
             BookPage(
                 book_name=book_name,
@@ -113,12 +117,17 @@ def discover_books(output_dir: Path = OUTPUT_DIR) -> list[BookPage]:
                 audio_assets=audio_assets,
                 document_type=document_type,
                 labels=labels,
+                added_date=added_date,
                 total_size_bytes=total_size_bytes,
                 file_count=len(files),
             )
         )
 
-    return sorted(books, key=lambda book: book.title.casefold())
+    return sorted(
+        sorted(books, key=lambda book: book.title.casefold()),
+        key=lambda book: book.added_date,
+        reverse=True,
+    )
 
 
 def main() -> None:
@@ -228,6 +237,13 @@ def _format_size(size_bytes: int) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{value:.1f} TB"
+
+
+def _format_date(value: str) -> str:
+    try:
+        return date.fromisoformat(value).strftime("%d %b %Y")
+    except ValueError:
+        return value
 
 
 def _count_label(count: int, singular: str, plural: str | None = None) -> str:
@@ -348,6 +364,19 @@ h1 {
   font: inherit;
   padding: 12px 14px;
 }
+.toolbar {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.sort-select {
+  border: 1px solid var(--cp-border);
+  border-radius: 14px;
+  background: var(--cp-surface);
+  color: var(--cp-text);
+  font: inherit;
+  padding: 12px 14px;
+}
 .label-filters {
   display: flex;
   gap: 8px;
@@ -446,6 +475,7 @@ audio {
 }
 @media (max-width: 640px) {
   .page { width: min(100% - 20px, 1120px); padding-top: 32px; }
+  .toolbar { grid-template-columns: 1fr; }
 }
 </style>"""
 
@@ -488,7 +518,13 @@ def _render_landing_page(books: list[BookPage]) -> str:
       </div>
     </header>
     <section class="filters" aria-label="Library filters">
-      <input class="search-input" type="search" placeholder="Search materials..." aria-label="Search materials" data-search>
+      <div class="toolbar">
+        <input class="search-input" type="search" placeholder="Search materials..." aria-label="Search materials" data-search>
+        <select class="sort-select" aria-label="Sort materials" data-sort>
+          <option value="newest">Newest first</option>
+          <option value="title">Title A-Z</option>
+        </select>
+      </div>
       <div class="label-filters" aria-label="Topic filters">
         <button class="pill" type="button" data-filter="" data-active="true">All</button>
         {label_filters}
@@ -510,11 +546,12 @@ def _render_book_card(book: BookPage) -> str:
     summary = f"<p>{html.escape(book.summary)}</p>" if book.summary else ""
     labels = " ".join(f'<span class="pill">{html.escape(label)}</span>' for label in book.labels)
     search_text = f"{book.title} {book.summary} {display_document_label(book.document_type)} {' '.join(book.labels)}"
-    return f"""<a class="card" href="{page_href}" data-book-card data-labels="{html.escape('|'.join(book.labels))}" data-search-text="{html.escape(search_text.casefold())}">
+    return f"""<a class="card" href="{page_href}" data-book-card data-labels="{html.escape('|'.join(book.labels))}" data-search-text="{html.escape(search_text.casefold())}" data-title="{html.escape(book.title.casefold())}" data-added-date="{html.escape(book.added_date)}">
   <article>
     <h2>{html.escape(book.title)}</h2>
     {summary}
     <footer>
+      <span class="pill">Added {_format_date(book.added_date)}</span>
       {labels}
     </footer>
   </article>
@@ -544,6 +581,7 @@ def _render_book_page(book: BookPage) -> str:
         <span class="pill">{len(book.audio_assets)} recordings</span>
         <span class="pill">{book.file_count} files</span>
         <span class="pill">{_format_size(book.total_size_bytes)}</span>
+        <span class="pill">Added {_format_date(book.added_date)}</span>
         {labels}
       </div>
       <nav class="actions" aria-label="Book actions">
@@ -576,6 +614,8 @@ def _landing_script() -> str:
     return """<script>
   (() => {
     const search = document.querySelector("[data-search]");
+    const sort = document.querySelector("[data-sort]");
+    const grid = document.querySelector("[data-book-grid]");
     const cards = Array.from(document.querySelectorAll("[data-book-card]"));
     const filters = Array.from(document.querySelectorAll("[data-filter]"));
     const empty = document.querySelector("[data-empty-state]");
@@ -584,6 +624,12 @@ def _landing_script() -> str:
     const applyFilters = () => {
       const query = search.value.trim().toLowerCase();
       let visible = 0;
+      const sortedCards = [...cards].sort((left, right) => {
+        if (sort.value === "title") return left.dataset.title.localeCompare(right.dataset.title);
+        return right.dataset.addedDate.localeCompare(left.dataset.addedDate)
+          || left.dataset.title.localeCompare(right.dataset.title);
+      });
+      sortedCards.forEach((card) => grid.appendChild(card));
       cards.forEach((card) => {
         const textMatch = !query || card.dataset.searchText.includes(query);
         const labels = (card.dataset.labels || "").split("|");
@@ -596,6 +642,7 @@ def _landing_script() -> str:
     };
 
     search.addEventListener("input", applyFilters);
+    sort.addEventListener("change", applyFilters);
     filters.forEach((filter) => {
       filter.addEventListener("click", () => {
         selectedLabel = filter.dataset.filter || "";

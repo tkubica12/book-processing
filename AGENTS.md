@@ -21,7 +21,9 @@ Coding conventions and tooling guidance for AI agents working in this repository
 - Treat `input\arxiv\*.pdf` as arXiv papers. There are never folders under `input\arxiv\`; ignore anything there that is not a direct PDF file.
 - Treat every other supported top-level file or folder under `input\` as a book. Single-file books can be PDF, EPUB, Markdown/text, or audio. A top-level folder is one book only when it contains supported audio files.
 - Stage 1 writes `output\<book_name>\<book_name>_source_raw.md`, mirrors it to `wiki\<book_name>.md`, and writes `output\<book_name>\metadata.yaml`.
-- `metadata.yaml` is the source of truth for `source_path`, `document_type`, `source_medium`, and labels. Valid `document_type` values are `book` and `paper`; valid labels are `AI`, `security`, `computers`, `biology`, `physics`, `technology`, `psychology`, and `other`.
+- `metadata.yaml` is the source of truth for `source_path`, `document_type`, `source_medium`, `added_date`, and labels. Valid `document_type` values are `book` and `paper`; every item should display exactly one document tag (`Book` or `Paper`) and usually one dominant topic tag.
+- Valid topic labels are `AI`, `ComputerScience`, `Science`, `Technology`, and `Other`. Do not keep overlapping topic tags when one topic is dominant; `AI` should usually stand alone without additional topic labels. `ComputerScience` covers the old `computers` and `security` labels. `Science` covers the old `physics`, `psychology`, and `biology` labels.
+- Existing items without reliable chronology use `added_date: 2026-05-01`; newly processed items should get today's ISO date.
 - Papers generate only `summary_5min`, `summary_20min`, and `podcast_20min`. Do not generate 60-minute podcasts or full `source_tts` for papers.
 - Run the processing pipeline with `uv run --no-sync book-processing` when refreshing content. It resumes existing outputs and regenerates the static catalog at the end.
 - Run only the static web catalog generator with `uv run --no-sync book-processing-site` when source outputs are already current and only `output\index.html` / per-book `index.html` need refreshing.
@@ -35,12 +37,18 @@ Coding conventions and tooling guidance for AI agents working in this repository
 - Browser authentication is handled by custom in-app GitHub OAuth. Do not enable ACA Easy Auth. Blob authentication is handled server-side by the ACA system-assigned managed identity with `Storage Blob Data Reader`.
 - Do not expose blobs publicly, do not use SAS links in generated HTML, and do not depend on Azure Files mounts; this tenant disables shared-key access and ACA Azure Files mounts need shared keys.
 - To deploy or refresh infrastructure/content, prefer `.\scripts\deploy-web.ps1`. The script regenerates the site, creates/updates Azure resources, uploads `output\`, and enforces Cold tier.
+- Before recreating or updating ACA, verify GitHub OAuth settings are available. Missing OAuth envs cause `500 Internal Server Error`; using an OAuth app from another site causes GitHub `redirect_uri is not associated with this application`.
+- The books site must use a GitHub OAuth app whose callback URL is exactly `https://books.tomasonline.net/oauth/github/callback`. Do not copy OAuth client IDs/secrets from other Container Apps unless you have confirmed that callback URL is registered for that app.
+- Keep ACA env vars `PUBLIC_BASE_URL=https://books.tomasonline.net`, `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET=secretref:github-oauth-client-secret`, `GITHUB_OAUTH_COOKIE_SECRET=secretref:github-oauth-cookie-secret`, and `ALLOWED_GITHUB_LOGINS=tkubica12,jjindrich,martinpolivka,michalmar,fslanicka`.
 - If doing a manual content-only refresh, use AzCopy with Entra auth:
 
 ```powershell
-azcopy login --tenant-id <tenant-id>
+az storage account update --name booksite673af34d6b --resource-group rg-book-processing-site --public-network-access Enabled --default-action Allow
+$env:AZCOPY_AUTO_LOGIN_TYPE = "AZCLI"
 azcopy sync output https://booksite673af34d6b.blob.core.windows.net/books --recursive=true --delete-destination=true
 azcopy set-properties https://booksite673af34d6b.blob.core.windows.net/books --block-blob-tier=Cold --recursive=true
+az storage account update --name booksite673af34d6b --resource-group rg-book-processing-site --public-network-access Enabled --default-action Deny
 ```
 
 - After deployment, smoke-test unauthenticated access with `curl.exe -I -L --max-redirs 0 https://books.tomasonline.net/`; expected result is `302 Found` redirecting to GitHub OAuth.
+- If smoke test fails, inspect ACA logs first with `az containerapp logs show --name ca-book-processing-site-vnet --resource-group rg-book-processing-site --tail 80`; do not assume the content upload is the problem.

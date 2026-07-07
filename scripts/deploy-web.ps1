@@ -1,8 +1,8 @@
 param(
     [string]$ResourceGroup = "rg-book-processing-site",
     [string]$Location = "westeurope",
-    [string]$ContainerAppName = "ca-book-processing-site",
-    [string]$EnvironmentName = "cae-book-processing-site",
+    [string]$ContainerAppName = "ca-book-processing-site-vnet",
+    [string]$EnvironmentName = "cae-book-processing-site-vnet",
     [string]$StorageAccountName = "",
     [string]$BlobContainerName = "books",
     [string]$RegistryName = "",
@@ -13,7 +13,7 @@ param(
     [string]$GitHubOAuthClientId = $env:GITHUB_OAUTH_CLIENT_ID,
     [string]$GitHubOAuthClientSecret = $env:GITHUB_OAUTH_CLIENT_SECRET,
     [string]$GitHubOAuthCookieSecret = $env:GITHUB_OAUTH_COOKIE_SECRET,
-    [string]$AllowedGitHubLogins = "tkubica12",
+    [string]$AllowedGitHubLogins = "tkubica12,jjindrich,martinpolivka,michalmar,fslanicka",
     [string]$AllowedGitHubEmails = "",
     [string]$OutputDir = "output",
     [switch]$SkipStorageNetworkPolicyExemption,
@@ -69,6 +69,9 @@ if (-not $RegistryName) {
 }
 if (-not $Image) {
     $Image = "ghcr.io/tkubica12/book-processing/book-processing-site:latest"
+}
+if (-not $GitHubOAuthClientId -or -not $GitHubOAuthClientSecret -or -not $GitHubOAuthCookieSecret) {
+    throw "GitHub OAuth settings are required. Set GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET, and GITHUB_OAUTH_COOKIE_SECRET or pass the matching parameters."
 }
 
 Write-Host "Generate local index pages"
@@ -273,10 +276,6 @@ if ($CustomHostname) {
         --output none
 }
 
-if (-not $GitHubOAuthClientId -or -not $GitHubOAuthClientSecret -or -not $GitHubOAuthCookieSecret) {
-    throw "GitHub OAuth settings are required. Set GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET, and GITHUB_OAUTH_COOKIE_SECRET or pass the matching parameters."
-}
-
 $publicBaseUrl = if ($CustomHostname) { "https://$CustomHostname" } else { "https://$fqdn" }
 Write-Host "Configure app-level GitHub OAuth for $AllowedGitHubLogins"
 az containerapp secret set `
@@ -315,18 +314,41 @@ if (-not $SkipUpload) {
     Write-Host "Upload output to private Blob Storage"
     $azCopyPath = Get-AzCopyPath
     $destination = "https://$StorageAccountName.blob.core.windows.net/$BlobContainerName"
+    $networkDefaultAction = az storage account show `
+        --name $StorageAccountName `
+        --resource-group $ResourceGroup `
+        --query "networkRuleSet.defaultAction" `
+        -o tsv
     az storage account update `
         --name $StorageAccountName `
         --resource-group $ResourceGroup `
         --public-network-access Enabled `
+        --default-action Allow `
         --output none
+    Start-Sleep -Seconds 30
+    $env:AZCOPY_AUTO_LOGIN_TYPE = "AZCLI"
     & $azCopyPath sync $OutputDir $destination --recursive=true --delete-destination=true
-    if ($LASTEXITCODE -ne 0) {
-        throw "AzCopy sync failed with exit code $LASTEXITCODE. Run: $azCopyPath login --tenant-id $tenantId"
+    $syncExitCode = $LASTEXITCODE
+    if ($syncExitCode -eq 0) {
+        & $azCopyPath set-properties $destination --block-blob-tier=Cold --recursive=true
+        $tierExitCode = $LASTEXITCODE
+    } else {
+        $tierExitCode = 0
     }
-    & $azCopyPath set-properties $destination --block-blob-tier=Cold --recursive=true
+    az storage account update `
+        --name $StorageAccountName `
+        --resource-group $ResourceGroup `
+        --public-network-access Enabled `
+        --default-action $networkDefaultAction `
+        --output none
     if ($LASTEXITCODE -ne 0) {
-        throw "AzCopy Cold tier update failed with exit code $LASTEXITCODE."
+        throw "Failed to restore storage firewall default action to $networkDefaultAction."
+    }
+    if ($syncExitCode -ne 0) {
+        throw "AzCopy sync failed with exit code $syncExitCode. Run: $azCopyPath login --tenant-id $tenantId"
+    }
+    if ($tierExitCode -ne 0) {
+        throw "AzCopy Cold tier update failed with exit code $tierExitCode."
     }
 }
 

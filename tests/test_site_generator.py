@@ -16,7 +16,7 @@ def test_generate_site_creates_landing_and_book_pages(tmp_path: Path):
     (book_dir / "sample_book_podcast_20min_cs.mp3").write_bytes(b"audio")
     (book_dir / "sample_book_source_raw.md").write_text("# Sample", encoding="utf-8")
     (book_dir / "metadata.yaml").write_text(
-        "source_path: Sample.md\ndocument_type: book\nsource_medium: text\nlabels:\n- other\n",
+        "source_path: Sample.md\ndocument_type: book\nsource_medium: text\nadded_date: 2026-05-01\nlabels:\n- Other\n",
         encoding="utf-8",
     )
 
@@ -32,8 +32,10 @@ def test_generate_site_creates_landing_and_book_pages(tmp_path: Path):
     assert 'type="search"' in landing
     assert "1 book" in landing
     assert "0 papers" in landing
-    assert 'data-filter="other"' in landing
+    assert 'data-filter="Other"' in landing
     assert 'data-filter="Book"' in landing
+    assert 'data-sort' in landing
+    assert 'data-added-date="2026-05-01"' in landing
     assert "data-book-card" in landing
     assert "Sample Book" in landing
     assert "sample_book/index.html" in landing
@@ -42,7 +44,8 @@ def test_generate_site_creates_landing_and_book_pages(tmp_path: Path):
     assert "5-minute summary - English" in detail
     assert "20-minute podcast - Czech" in detail
     assert 'preload="none"' in detail
-    assert "other" in detail
+    assert "Added 01 May 2026" in detail
+    assert "Other" in detail
     assert "Book" in detail
 
 
@@ -65,7 +68,7 @@ def test_discover_books_infers_topic_labels(tmp_path: Path):
     books = discover_books(tmp_path)
 
     assert books[0].document_type == "book"
-    assert books[0].labels == ("Book", "AI", "biology")
+    assert books[0].labels == ("Book", "AI")
 
 
 def test_discover_books_marks_arxiv_papers(tmp_path: Path):
@@ -83,6 +86,7 @@ def test_discover_books_marks_arxiv_papers(tmp_path: Path):
         "source_path: arxiv/Hybrid Dynamic Routing.pdf\n"
         "document_type: paper\n"
         "source_medium: PDF\n"
+        "added_date: 2026-07-07\n"
         "labels:\n"
         "- AI\n"
         "- computers\n",
@@ -92,4 +96,5 @@ def test_discover_books_marks_arxiv_papers(tmp_path: Path):
     books = discover_books(tmp_path)
 
     assert books[0].document_type == "paper"
-    assert books[0].labels == ("arXiv", "AI", "computers")
+    assert books[0].labels == ("Paper", "AI")
+    assert books[0].added_date == "2026-07-07"
